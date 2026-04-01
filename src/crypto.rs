@@ -61,12 +61,14 @@ pub fn init_vault(password: &str) -> Result<(VaultMetadata, [u8; DEK_LEN])> {
 pub fn unwrap_dek(password: &str, meta: &VaultMetadata) -> Result<[u8; DEK_LEN]> {
     let mut master_seed = derive_master_seed(password, &meta.salt)?;
 
-    let x25519_seed: [u8; 32] = master_seed[..32].try_into().unwrap();
-    let mlkem_seed: [u8; 32] = master_seed[32..64].try_into().unwrap();
+    let mut x25519_seed: [u8; 32] = master_seed[..32].try_into().unwrap();
+    let mut mlkem_seed: [u8; 32] = master_seed[32..64].try_into().unwrap();
     master_seed.zeroize();
 
     let (x25519_static_secret, _) = derive_x25519_static(&x25519_seed);
     let (dk_kem, _) = derive_mlkem_keypair(&mlkem_seed);
+    x25519_seed.zeroize();
+    mlkem_seed.zeroize();
 
     // X25519 DH with ephemeral public key
     let x25519_eph_pub_bytes: [u8; 32] = meta
@@ -118,12 +120,14 @@ pub fn wrap_dek(password: &str, dek: &[u8; DEK_LEN]) -> Result<VaultMetadata> {
 
     let mut master_seed = derive_master_seed(password, &salt)?;
 
-    let x25519_seed: [u8; 32] = master_seed[..32].try_into().unwrap();
-    let mlkem_seed: [u8; 32] = master_seed[32..64].try_into().unwrap();
+    let mut x25519_seed: [u8; 32] = master_seed[..32].try_into().unwrap();
+    let mut mlkem_seed: [u8; 32] = master_seed[32..64].try_into().unwrap();
     master_seed.zeroize();
 
     let (_x25519_static_secret, x25519_static_pub) = derive_x25519_static(&x25519_seed);
     let (_dk_kem, ek_kem) = derive_mlkem_keypair(&mlkem_seed);
+    x25519_seed.zeroize();
+    mlkem_seed.zeroize();
 
     // Hybrid wrap DEK
     let x25519_eph_secret = EphemeralSecret::random_from_rng(OsRng);

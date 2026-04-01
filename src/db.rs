@@ -239,6 +239,51 @@ mod tests {
     }
 
     #[test]
+    fn update_metadata_on_uninitialized_db_fails() {
+        let conn = test_db();
+        let meta = VaultMetadata {
+            salt: vec![1; 16],
+            ek_kem: vec![2; 32],
+            x25519_pub: vec![3; 32],
+            ct_kem: vec![4; 32],
+            x25519_eph: vec![5; 32],
+            wrap_nonce: vec![6; 12],
+            wrapped_dek: vec![7; 48],
+        };
+        assert!(update_metadata(&conn, &meta).is_err());
+    }
+
+    #[test]
+    fn update_metadata_after_store_succeeds() {
+        let conn = test_db();
+        let meta = VaultMetadata {
+            salt: vec![1; 16],
+            ek_kem: vec![2; 32],
+            x25519_pub: vec![3; 32],
+            ct_kem: vec![4; 32],
+            x25519_eph: vec![5; 32],
+            wrap_nonce: vec![6; 12],
+            wrapped_dek: vec![7; 48],
+        };
+        store_metadata(&conn, &meta).unwrap();
+
+        let updated = VaultMetadata {
+            salt: vec![9; 16],
+            ek_kem: vec![8; 32],
+            x25519_pub: vec![7; 32],
+            ct_kem: vec![6; 32],
+            x25519_eph: vec![5; 32],
+            wrap_nonce: vec![4; 12],
+            wrapped_dek: vec![3; 48],
+        };
+        update_metadata(&conn, &updated).unwrap();
+
+        let loaded = load_metadata(&conn).unwrap().unwrap();
+        assert_eq!(loaded.salt, vec![9; 16]);
+        assert_eq!(loaded.wrapped_dek, vec![3; 48]);
+    }
+
+    #[test]
     fn upsert_and_get_env_var() {
         let conn = test_db();
         upsert_env_var(&conn, "KEY1", b"nonce123456!", b"cipher", None).unwrap();

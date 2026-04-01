@@ -511,38 +511,43 @@ pub fn cmd_rotate_dek(
     password: &str,
     log: &mut Option<logger::Logger>,
 ) -> error::Result<()> {
-    let conn = db::open_or_create_db(db_path)?;
+    let mut conn = db::open_or_create_db(db_path)?;
     let meta = db::load_metadata(&conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
 
     let mut old_dek = unwrap_dek_logged(password, &meta, log)?;
 
-    // Decrypt all values with old DEK
-    let vars = db::list_env_vars(&conn)?;
-    let mut decrypted: Vec<(String, Vec<u8>, Option<String>)> = Vec::new();
+    // IMMEDIATE transaction to prevent concurrent writes during rotation
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(error::EnvsGateError::Db)?;
+
+    // Decrypt all values with old DEK (inside transaction for consistency)
+    let vars = db::list_env_vars(&tx)?;
+    let mut decrypted: Vec<(String, zeroize::Zeroizing<Vec<u8>>, Option<String>)> = Vec::new();
 
     for var in &vars {
         let plaintext = crypto::decrypt_value(&old_dek, &var.nonce, &var.ciphertext)?;
-        decrypted.push((var.key_name.clone(), plaintext, var.expires_at.clone()));
+        decrypted.push((
+            var.key_name.clone(),
+            zeroize::Zeroizing::new(plaintext),
+            var.expires_at.clone(),
+        ));
     }
 
     old_dek.zeroize();
 
-    // Generate new DEK, wrap with same password, re-encrypt all values atomically
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(error::EnvsGateError::Db)?;
-
+    // Generate new DEK, wrap with same password, re-encrypt all values
     let (new_meta, mut new_dek) = crypto::init_vault(password)?;
     db::update_metadata(&tx, &new_meta)?;
 
-    for (key, mut plaintext, expires_at) in decrypted {
-        let (nonce, ciphertext) = crypto::encrypt_value(&new_dek, &plaintext)?;
-        db::upsert_env_var(&tx, &key, &nonce, &ciphertext, expires_at.as_deref())?;
-        plaintext.zeroize();
+    for (key, plaintext, expires_at) in &decrypted {
+        let (nonce, ciphertext) = crypto::encrypt_value(&new_dek, plaintext)?;
+        db::upsert_env_var(&tx, key, &nonce, &ciphertext, expires_at.as_deref())?;
     }
 
     new_dek.zeroize();
+    drop(decrypted);
 
     tx.commit().map_err(error::EnvsGateError::Db)?;
 
