@@ -76,6 +76,12 @@ pub enum Commands {
     /// List all namespaces
     Namespaces,
 
+    /// Generate shell completions
+    Completions {
+        /// Shell type (bash, zsh, fish, elvish, powershell)
+        shell: clap_complete::Shell,
+    },
+
     /// View audit logs
     Logs {
         /// Output format
