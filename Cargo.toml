@@ -1,0 +1,27 @@
+[package]
+name = "envs-gate"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+fuse = ["dep:fuser", "dep:ctrlc"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+ml-kem = "0.2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes-gcm = "0.10"
+argon2 = "0.5"
+fuser = { version = "0.14", optional = true }
+chrono = "0.4"
+rand = "0.8"
+rand_chacha = "0.3"
+rand_core = "0.6"
+sha2 = "0.10"
+hkdf = "0.12"
+zeroize = { version = "1", features = ["derive"] }
+thiserror = "2"
+ctrlc = { version = "3", optional = true }
+libc = "0.2"
