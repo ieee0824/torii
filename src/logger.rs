@@ -166,6 +166,11 @@ impl Logger {
         self.log(&LogEntry::new("serve_read", None, Some(&detail)));
     }
 
+    pub fn log_exec(&mut self, command: &str, keys_count: usize) {
+        let detail = format!("cmd={command}, keys_injected={keys_count}");
+        self.log(&LogEntry::new("exec", None, Some(&detail)));
+    }
+
     pub fn log_auth_failed(&mut self) {
         self.log(&LogEntry::new("auth_failed", None, None));
     }

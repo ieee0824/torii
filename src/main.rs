@@ -345,6 +345,17 @@ pub fn cmd_serve(
     fuse_fs::serve(db_path, &dek, env_path, once)
 }
 
+static CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn forward_signal_to_child(sig: libc::c_int) {
+    let pid = CHILD_PID.load(std::sync::atomic::Ordering::SeqCst);
+    if pid > 0 {
+        unsafe {
+            libc::kill(pid, sig);
+        }
+    }
+}
+
 pub fn cmd_exec(
     db_path: &str,
     password: &str,
@@ -379,26 +390,55 @@ pub fn cmd_exec(
         }
 
         let mut plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
-        let value = String::from_utf8_lossy(&plaintext).to_string();
+        let value = String::from_utf8(plaintext.clone()).map_err(|_| {
+            error::EnvsGateError::InvalidInput(format!(
+                "Value for '{}' contains invalid UTF-8",
+                var.key_name
+            ))
+        })?;
         env_pairs.push((var.key_name.clone(), value));
         plaintext.zeroize();
     }
 
     if let Some(l) = log {
-        let detail = format!("cmd={}, keys_injected={}", command[0], env_pairs.len());
-        l.log_serve(&detail, false);
+        l.log_exec(&command[0], env_pairs.len());
     }
 
     let program = &command[0];
     let args = &command[1..];
 
-    let status = std::process::Command::new(program)
+    // NOTE: On Linux, injected env vars are visible via /proc/<pid>/environ
+    // to the process owner and root. This is an OS-level constraint.
+    let mut child = std::process::Command::new(program)
         .args(args)
-        .envs(env_pairs)
-        .status()
+        .envs(env_pairs.iter().cloned())
+        .spawn()
         .map_err(|e| {
             error::EnvsGateError::InvalidInput(format!("Failed to execute '{program}': {e}"))
         })?;
+
+    // Zeroize decrypted values immediately after spawn
+    for (_, mut val) in env_pairs {
+        val.zeroize();
+    }
+
+    // Forward SIGTERM/SIGINT to the child process
+    let child_pid = child.id() as i32;
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            forward_signal_to_child as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            forward_signal_to_child as *const () as libc::sighandler_t,
+        );
+        CHILD_PID.store(child_pid, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    let status = child.wait().map_err(|e| {
+        error::EnvsGateError::InvalidInput(format!("Failed to wait for child process: {e}"))
+    })?;
 
     std::process::exit(status.code().unwrap_or(1));
 }
