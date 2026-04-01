@@ -3,6 +3,7 @@ mod crypto;
 mod db;
 mod error;
 mod fuse_fs;
+mod logger;
 mod tui;
 
 use chrono::Local;
@@ -17,40 +18,68 @@ fn prompt_password() -> error::Result<String> {
         .map_err(|e| error::EnvsGateError::InvalidInput(format!("Password prompt failed: {e}")))
 }
 
+fn open_logger(log_path: &Option<String>) -> Option<logger::Logger> {
+    log_path
+        .as_deref()
+        .and_then(|p| logger::Logger::open(p).ok())
+}
+
 fn main() -> error::Result<()> {
     let cli = Cli::parse();
+    let mut log = open_logger(&cli.log_path);
 
     match cli.command {
-        None => return tui::run_interactive(&cli.db_path),
+        None => return tui::run_interactive(&cli.db_path, cli.log_path.as_deref()),
         Some(Commands::Set { key_value, expires }) => {
             let mut password = prompt_password()?;
-            let result = cmd_set(&cli.db_path, &password, &key_value, expires.as_deref());
+            let result = cmd_set(
+                &cli.db_path,
+                &password,
+                &key_value,
+                expires.as_deref(),
+                &mut log,
+            );
             password.zeroize();
             result?;
         }
         Some(Commands::Get { key }) => {
             let mut password = prompt_password()?;
-            let result = cmd_get(&cli.db_path, &password, &key);
+            let result = cmd_get(&cli.db_path, &password, &key, &mut log);
             password.zeroize();
             result?;
         }
         Some(Commands::List) => {
             let mut password = prompt_password()?;
-            let result = cmd_list(&cli.db_path, &password);
+            let result = cmd_list(&cli.db_path, &password, &mut log);
             password.zeroize();
             result?;
         }
         Some(Commands::Delete { key }) => {
             let mut password = prompt_password()?;
-            let result = cmd_delete(&cli.db_path, &password, &key);
+            let result = cmd_delete(&cli.db_path, &password, &key, &mut log);
             password.zeroize();
             result?;
         }
         Some(Commands::Serve { env_path, once }) => {
             let mut password = prompt_password()?;
-            let result = cmd_serve(&cli.db_path, &password, &env_path, once);
+            let result = cmd_serve(&cli.db_path, &password, &env_path, once, &mut log);
             password.zeroize();
             result?;
+        }
+        Some(Commands::Logs { format }) => {
+            let log_path = cli.log_path.as_deref().ok_or_else(|| {
+                error::EnvsGateError::InvalidInput("--log-path is required for logs command".into())
+            })?;
+            let fmt = match format.as_str() {
+                "json" => logger::LogFormat::Json,
+                "tsv" => logger::LogFormat::Tsv,
+                _ => {
+                    return Err(error::EnvsGateError::InvalidInput(
+                        "Invalid format. Use: json, tsv".into(),
+                    ));
+                }
+            };
+            logger::read_logs(log_path, fmt)?;
         }
     }
 
@@ -119,6 +148,7 @@ pub fn cmd_set(
     password: &str,
     key_value: &str,
     expires: Option<&str>,
+    log: &mut Option<logger::Logger>,
 ) -> error::Result<()> {
     let (key, value) = key_value
         .split_once('=')
@@ -142,6 +172,10 @@ pub fn cmd_set(
     let (nonce, ciphertext) = crypto::encrypt_value(&dek, value.as_bytes())?;
     db::upsert_env_var(&conn, key, &nonce, &ciphertext, resolved_expires.as_deref())?;
 
+    if let Some(l) = log {
+        l.log_set(key, resolved_expires.as_deref());
+    }
+
     if let Some(ref exp) = resolved_expires {
         eprintln!("Set: {key} (expires: {exp})");
     } else {
@@ -150,7 +184,12 @@ pub fn cmd_set(
     Ok(())
 }
 
-pub fn cmd_get(db_path: &str, password: &str, key: &str) -> error::Result<()> {
+pub fn cmd_get(
+    db_path: &str,
+    password: &str,
+    key: &str,
+    log: &mut Option<logger::Logger>,
+) -> error::Result<()> {
     let conn = db::open_or_create_db(db_path)?;
     let meta = db::load_metadata(&conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
@@ -162,10 +201,17 @@ pub fn cmd_get(db_path: &str, password: &str, key: &str) -> error::Result<()> {
     if let Some(ref exp) = var.expires_at
         && is_expired(exp)
     {
+        if let Some(l) = log {
+            l.log_expired(key);
+        }
         return Err(error::EnvsGateError::KeyExpired {
             key: key.into(),
             expired_at: exp.clone(),
         });
+    }
+
+    if let Some(l) = log {
+        l.log_get(key);
     }
 
     let mut plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
@@ -174,13 +220,21 @@ pub fn cmd_get(db_path: &str, password: &str, key: &str) -> error::Result<()> {
     Ok(())
 }
 
-pub fn cmd_list(db_path: &str, password: &str) -> error::Result<()> {
+pub fn cmd_list(
+    db_path: &str,
+    password: &str,
+    log: &mut Option<logger::Logger>,
+) -> error::Result<()> {
     let conn = db::open_or_create_db(db_path)?;
     let meta = db::load_metadata(&conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
     let dek = crypto::unwrap_dek(password, &meta)?;
 
     let vars = db::list_env_vars(&conn)?;
+
+    if let Some(l) = log {
+        l.log_list();
+    }
 
     for var in &vars {
         let expired = var.expires_at.as_ref().is_some_and(|exp| is_expired(exp));
@@ -208,7 +262,12 @@ pub fn cmd_list(db_path: &str, password: &str) -> error::Result<()> {
     Ok(())
 }
 
-pub fn cmd_delete(db_path: &str, password: &str, key: &str) -> error::Result<()> {
+pub fn cmd_delete(
+    db_path: &str,
+    password: &str,
+    key: &str,
+    log: &mut Option<logger::Logger>,
+) -> error::Result<()> {
     let conn = db::open_or_create_db(db_path)?;
     let meta = db::load_metadata(&conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
@@ -216,6 +275,9 @@ pub fn cmd_delete(db_path: &str, password: &str, key: &str) -> error::Result<()>
     let _dek = crypto::unwrap_dek(password, &meta)?;
 
     if db::delete_env_var(&conn, key)? {
+        if let Some(l) = log {
+            l.log_delete(key);
+        }
         eprintln!("Deleted: {key}");
     } else {
         return Err(error::EnvsGateError::KeyNotFound(key.into()));
@@ -224,7 +286,13 @@ pub fn cmd_delete(db_path: &str, password: &str, key: &str) -> error::Result<()>
     Ok(())
 }
 
-pub fn cmd_serve(db_path: &str, password: &str, env_path: &str, once: bool) -> error::Result<()> {
+pub fn cmd_serve(
+    db_path: &str,
+    password: &str,
+    env_path: &str,
+    once: bool,
+    log: &mut Option<logger::Logger>,
+) -> error::Result<()> {
     let conn = db::open_or_create_db(db_path)?;
     let meta = db::load_metadata(&conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
@@ -240,6 +308,10 @@ pub fn cmd_serve(db_path: &str, password: &str, env_path: &str, once: bool) -> e
                 expired_at: exp.clone(),
             });
         }
+    }
+
+    if let Some(l) = log {
+        l.log_serve(env_path, once);
     }
 
     fuse_fs::serve(db_path, &dek, env_path, once)
@@ -321,7 +393,7 @@ mod tests {
         assert!(parse_expires("2030-01-01T25:00:00").is_err());
     }
 
-    // --- is_expired: 正常系 ---
+    // --- is_expired ---
 
     #[test]
     fn is_expired_past_datetime() {
@@ -343,8 +415,6 @@ mod tests {
         assert!(!is_expired("2099-12-31"));
     }
 
-    // --- is_expired: 異常系 ---
-
     #[test]
     fn is_expired_invalid_format_returns_false() {
         assert!(!is_expired("not-a-date"));
@@ -355,7 +425,7 @@ mod tests {
         assert!(!is_expired(""));
     }
 
-    // --- cmd_set / cmd_get / cmd_delete 統合テスト ---
+    // --- 統合テスト ---
 
     #[test]
     fn set_get_delete_roundtrip() {
@@ -363,7 +433,7 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "MY_KEY=my_value", None).unwrap();
+        cmd_set(db_path, "pw", "MY_KEY=my_value", None, &mut None).unwrap();
 
         let conn = db::open_or_create_db(db_path).unwrap();
         let meta = db::load_metadata(&conn).unwrap().unwrap();
@@ -372,7 +442,7 @@ mod tests {
         let plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext).unwrap();
         assert_eq!(plaintext, b"my_value");
 
-        cmd_delete(db_path, "pw", "MY_KEY").unwrap();
+        cmd_delete(db_path, "pw", "MY_KEY", &mut None).unwrap();
         assert!(db::get_env_var(&conn, "MY_KEY").unwrap().is_none());
     }
 
@@ -382,8 +452,8 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "correct", "K=V", None).unwrap();
-        let result = cmd_set(db_path, "wrong", "K2=V2", None);
+        cmd_set(db_path, "correct", "K=V", None, &mut None).unwrap();
+        let result = cmd_set(db_path, "wrong", "K2=V2", None, &mut None);
         assert!(result.is_err());
     }
 
@@ -393,8 +463,8 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "EXISTS=yes", None).unwrap();
-        let result = cmd_get(db_path, "pw", "NOPE");
+        cmd_set(db_path, "pw", "EXISTS=yes", None, &mut None).unwrap();
+        let result = cmd_get(db_path, "pw", "NOPE", &mut None);
         assert!(result.is_err());
     }
 
@@ -404,8 +474,8 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "OLD=val", Some("2000-01-01")).unwrap();
-        let result = cmd_get(db_path, "pw", "OLD");
+        cmd_set(db_path, "pw", "OLD=val", Some("2000-01-01"), &mut None).unwrap();
+        let result = cmd_get(db_path, "pw", "OLD", &mut None);
         assert!(result.is_err());
     }
 
@@ -415,8 +485,8 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "K=V", None).unwrap();
-        let result = cmd_delete(db_path, "pw", "MISSING");
+        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
+        let result = cmd_delete(db_path, "pw", "MISSING", &mut None);
         assert!(result.is_err());
     }
 
@@ -426,7 +496,7 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        let result = cmd_set(db_path, "pw", "NO_EQUALS_SIGN", None);
+        let result = cmd_set(db_path, "pw", "NO_EQUALS_SIGN", None, &mut None);
         assert!(result.is_err());
     }
 
@@ -436,12 +506,42 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "K=V", Some("1h")).unwrap();
+        cmd_set(db_path, "pw", "K=V", Some("1h"), &mut None).unwrap();
 
         let conn = db::open_or_create_db(db_path).unwrap();
         let var = db::get_env_var(&conn, "K").unwrap().unwrap();
         assert!(var.expires_at.is_some());
         let exp = var.expires_at.unwrap();
         chrono::NaiveDateTime::parse_from_str(&exp, "%Y-%m-%dT%H:%M:%S").unwrap();
+    }
+
+    // --- ロガー統合テスト ---
+
+    #[test]
+    fn commands_write_audit_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+        let log_path = dir.path().join("audit.log");
+        let log_path_str = log_path.to_str().unwrap();
+
+        let mut log = Some(logger::Logger::open(log_path_str).unwrap());
+
+        cmd_set(db_path, "pw", "K=V", None, &mut log).unwrap();
+        cmd_get(db_path, "pw", "K", &mut log).unwrap();
+        cmd_list(db_path, "pw", &mut log).unwrap();
+        cmd_delete(db_path, "pw", "K", &mut log).unwrap();
+
+        drop(log);
+
+        let content = std::fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 4);
+
+        let actions: Vec<String> = lines
+            .iter()
+            .map(|l| serde_json::from_str::<logger::LogEntry>(l).unwrap().action)
+            .collect();
+        assert_eq!(actions, vec!["set", "get", "list", "delete"]);
     }
 }
