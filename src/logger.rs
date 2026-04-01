@@ -7,12 +7,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{EnvsGateError, Result};
 
+const MAX_LOG_SIZE: u64 = 10 * 1024 * 1024; // 10MB
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     pub timestamp: String,
     pub action: String,
     pub key: Option<String>,
     pub detail: Option<String>,
+}
+
+/// Sanitize a string for TSV output: replace tabs and newlines with spaces
+fn sanitize_tsv(s: &str) -> String {
+    s.replace(['\t', '\n', '\r'], " ")
 }
 
 impl LogEntry {
@@ -28,16 +35,17 @@ impl LogEntry {
     pub fn to_tsv(&self) -> String {
         format!(
             "{}\t{}\t{}\t{}",
-            self.timestamp,
-            self.action,
-            self.key.as_deref().unwrap_or("-"),
-            self.detail.as_deref().unwrap_or("-"),
+            sanitize_tsv(&self.timestamp),
+            sanitize_tsv(&self.action),
+            sanitize_tsv(self.key.as_deref().unwrap_or("-")),
+            sanitize_tsv(self.detail.as_deref().unwrap_or("-")),
         )
     }
 }
 
 pub struct Logger {
     file: File,
+    path: String,
 }
 
 impl Logger {
@@ -45,21 +53,40 @@ impl Logger {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(path)
             .map_err(|e| EnvsGateError::InvalidInput(format!("Cannot open log file: {e}")))?;
 
-        // Restrict log file permissions
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            let _ = std::fs::set_permissions(path, perms);
+        Ok(Self {
+            file,
+            path: path.to_string(),
+        })
+    }
+
+    fn check_rotate(&mut self) -> Result<()> {
+        let metadata = self
+            .file
+            .metadata()
+            .map_err(|e| EnvsGateError::InvalidInput(format!("Log metadata: {e}")))?;
+
+        if metadata.len() >= MAX_LOG_SIZE {
+            let rotated = format!("{}.old", self.path);
+            let _ = std::fs::rename(&self.path, &rotated);
+
+            self.file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&self.path)
+                .map_err(|e| EnvsGateError::InvalidInput(format!("Log rotate: {e}")))?;
         }
 
-        Ok(Self { file })
+        Ok(())
     }
 
     fn write_entry(&mut self, entry: &LogEntry) -> Result<()> {
+        let _ = self.check_rotate();
+
         let json = serde_json::to_string(entry)
             .map_err(|e| EnvsGateError::InvalidInput(format!("JSON serialize: {e}")))?;
         writeln!(self.file, "{json}")
@@ -70,44 +97,60 @@ impl Logger {
     pub fn log_set(&mut self, key: &str, expires: Option<&str>) {
         let detail = expires.map(|e| format!("expires={e}"));
         let entry = LogEntry::new("set", Some(key), detail.as_deref());
-        let _ = self.write_entry(&entry);
+        if let Err(e) = self.write_entry(&entry) {
+            eprintln!("Warning: audit log write failed: {e}");
+        }
     }
 
     pub fn log_get(&mut self, key: &str) {
         let entry = LogEntry::new("get", Some(key), None);
-        let _ = self.write_entry(&entry);
+        if let Err(e) = self.write_entry(&entry) {
+            eprintln!("Warning: audit log write failed: {e}");
+        }
     }
 
     pub fn log_list(&mut self) {
         let entry = LogEntry::new("list", None, None);
-        let _ = self.write_entry(&entry);
+        if let Err(e) = self.write_entry(&entry) {
+            eprintln!("Warning: audit log write failed: {e}");
+        }
     }
 
     pub fn log_delete(&mut self, key: &str) {
         let entry = LogEntry::new("delete", Some(key), None);
-        let _ = self.write_entry(&entry);
+        if let Err(e) = self.write_entry(&entry) {
+            eprintln!("Warning: audit log write failed: {e}");
+        }
     }
 
     pub fn log_serve(&mut self, env_path: &str, once: bool) {
         let detail = format!("path={env_path}, once={once}");
         let entry = LogEntry::new("serve", None, Some(&detail));
-        let _ = self.write_entry(&entry);
+        if let Err(e) = self.write_entry(&entry) {
+            eprintln!("Warning: audit log write failed: {e}");
+        }
     }
 
     pub fn log_serve_read(&mut self, keys_count: usize) {
         let detail = format!("keys_served={keys_count}");
         let entry = LogEntry::new("serve_read", None, Some(&detail));
-        let _ = self.write_entry(&entry);
+        if let Err(e) = self.write_entry(&entry) {
+            eprintln!("Warning: audit log write failed: {e}");
+        }
     }
 
     pub fn log_auth_failed(&mut self) {
         let entry = LogEntry::new("auth_failed", None, None);
-        let _ = self.write_entry(&entry);
+        if let Err(e) = self.write_entry(&entry) {
+            eprintln!("Warning: audit log write failed: {e}");
+        }
     }
 
     pub fn log_expired(&mut self, key: &str) {
         let entry = LogEntry::new("expired", Some(key), None);
-        let _ = self.write_entry(&entry);
+        if let Err(e) = self.write_entry(&entry) {
+            eprintln!("Warning: audit log write failed: {e}");
+        }
     }
 }
 
@@ -145,6 +188,8 @@ pub fn read_logs(path: &str, format: LogFormat) -> Result<()> {
     Ok(())
 }
 
+use std::os::unix::fs::OpenOptionsExt;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,12 +212,33 @@ mod tests {
     }
 
     #[test]
+    fn log_entry_to_tsv_sanitizes_special_chars() {
+        let entry = LogEntry::new(
+            "set",
+            Some("KEY\twith\ttabs"),
+            Some("detail\nwith\nnewlines"),
+        );
+        let tsv = entry.to_tsv();
+        assert!(!tsv.contains('\n'));
+        // Only tabs as TSV delimiters (3 tabs for 4 fields)
+        assert_eq!(tsv.matches('\t').count(), 3);
+    }
+
+    #[test]
     fn log_entry_json_roundtrip() {
         let entry = LogEntry::new("get", Some("DB_URL"), None);
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: LogEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.action, "get");
         assert_eq!(parsed.key.as_deref(), Some("DB_URL"));
+    }
+
+    #[test]
+    fn log_entry_json_with_special_chars() {
+        let entry = LogEntry::new("set", Some("KEY\t\n\"evil\""), None);
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: LogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.key.as_deref(), Some("KEY\t\n\"evil\""));
     }
 
     #[test]
@@ -203,6 +269,22 @@ mod tests {
     }
 
     #[test]
+    fn logger_file_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("test.log");
+        let log_path_str = log_path.to_str().unwrap();
+
+        let _logger = Logger::open(log_path_str).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&log_path).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
     fn read_logs_tsv_format() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("test.log");
@@ -212,7 +294,6 @@ mod tests {
         logger.log_set("K", None);
         drop(logger);
 
-        // Should not error
         read_logs(log_path_str, LogFormat::Tsv).unwrap();
         read_logs(log_path_str, LogFormat::Json).unwrap();
     }
