@@ -7,7 +7,7 @@ mod logger;
 mod tui;
 
 use chrono::Local;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use cli::{Cli, Commands};
 use zeroize::Zeroize;
 
@@ -162,9 +162,13 @@ fn unwrap_dek_logged(
 fn main() -> error::Result<()> {
     let cli = Cli::parse();
 
-    // Handle namespaces command before resolving paths (no DB needed)
+    // Handle commands that don't need DB or password
     if matches!(cli.command, Some(Commands::Namespaces)) {
         return cmd_namespaces();
+    }
+    if let Some(Commands::Completions { shell }) = &cli.command {
+        clap_complete::generate(*shell, &mut Cli::command(), "torii", &mut std::io::stdout());
+        return Ok(());
     }
 
     let (db_path, log_path) = resolve_paths(&cli.db_path, &cli.namespace, &cli.log_path)?;
@@ -230,7 +234,7 @@ fn main() -> error::Result<()> {
             password.zeroize();
             result?;
         }
-        Some(Commands::Namespaces) => unreachable!(),
+        Some(Commands::Namespaces) | Some(Commands::Completions { .. }) => unreachable!(),
         Some(Commands::Logs { format }) => {
             let fmt = match format.as_str() {
                 "json" => logger::LogFormat::Json,

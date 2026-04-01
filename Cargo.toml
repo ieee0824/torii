@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 rusqlite = { version = "0.31", features = ["bundled"] }
 ml-kem = "0.2"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
