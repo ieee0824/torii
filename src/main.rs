@@ -39,6 +39,11 @@ fn validate_namespace(ns: &str) -> error::Result<()> {
             "Invalid namespace name".into(),
         ));
     }
+    if ns.len() > 64 {
+        return Err(error::EnvsGateError::InvalidInput(
+            "Namespace name must be 64 characters or fewer".into(),
+        ));
+    }
     if !ns
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -73,6 +78,15 @@ fn resolve_paths(
     std::fs::create_dir_all(&ns_dir).map_err(|e| {
         error::EnvsGateError::InvalidInput(format!("Cannot create namespace directory: {e}"))
     })?;
+
+    // Restrict directory permissions to owner only (0o700)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        let _ = std::fs::set_permissions(&torii_home, perms.clone());
+        let _ = std::fs::set_permissions(&ns_dir, perms);
+    }
 
     let db = format!("{ns_dir}/torii.db");
 
@@ -1206,6 +1220,29 @@ mod tests {
         assert!(validate_namespace("foo/bar").is_err());
         assert!(validate_namespace("foo bar").is_err());
         assert!(validate_namespace("a@b").is_err());
+        // Length limit
+        assert!(validate_namespace(&"a".repeat(64)).is_ok());
+        assert!(validate_namespace(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn resolve_paths_sets_directory_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        unsafe { std::env::set_var("HOME", home) };
+
+        resolve_paths(&None, "permtest", &None).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let torii_dir = format!("{home}/.torii");
+            let ns_dir = format!("{torii_dir}/permtest");
+            let torii_perms = std::fs::metadata(&torii_dir).unwrap().permissions().mode() & 0o777;
+            let ns_perms = std::fs::metadata(&ns_dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(torii_perms, 0o700);
+            assert_eq!(ns_perms, 0o700);
+        }
     }
 
     #[test]
