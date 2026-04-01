@@ -531,7 +531,7 @@ pub fn cmd_rotate_dek(
     // Generate new DEK, wrap with same password, re-encrypt all values atomically
     let tx = conn
         .unchecked_transaction()
-        .map_err(|e| error::EnvsGateError::Db(e))?;
+        .map_err(error::EnvsGateError::Db)?;
 
     let (new_meta, mut new_dek) = crypto::init_vault(password)?;
     db::update_metadata(&tx, &new_meta)?;
@@ -544,7 +544,7 @@ pub fn cmd_rotate_dek(
 
     new_dek.zeroize();
 
-    tx.commit().map_err(|e| error::EnvsGateError::Db(e))?;
+    tx.commit().map_err(error::EnvsGateError::Db)?;
 
     if let Some(l) = log {
         l.log_rotate_dek(vars.len());
