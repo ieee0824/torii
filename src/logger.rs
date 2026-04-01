@@ -171,6 +171,15 @@ impl Logger {
         self.log(&LogEntry::new("exec", None, Some(&detail)));
     }
 
+    pub fn log_rotate_password(&mut self) {
+        self.log(&LogEntry::new("rotate_password", None, None));
+    }
+
+    pub fn log_rotate_dek(&mut self, reencrypted: usize) {
+        let detail = format!("reencrypted={reencrypted}");
+        self.log(&LogEntry::new("rotate_dek", None, Some(&detail)));
+    }
+
     pub fn log_auth_failed(&mut self) {
         self.log(&LogEntry::new("auth_failed", None, None));
     }

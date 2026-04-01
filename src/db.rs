@@ -95,6 +95,27 @@ pub fn load_metadata(conn: &Connection) -> Result<Option<VaultMetadata>> {
     }
 }
 
+pub fn update_metadata(conn: &Connection, meta: &VaultMetadata) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE metadata SET salt = ?1, ek_kem = ?2, x25519_pub = ?3, ct_kem = ?4, x25519_eph = ?5, wrap_nonce = ?6, wrapped_dek = ?7 WHERE id = 1",
+        params![
+            meta.salt,
+            meta.ek_kem,
+            meta.x25519_pub,
+            meta.ct_kem,
+            meta.x25519_eph,
+            meta.wrap_nonce,
+            meta.wrapped_dek,
+        ],
+    )?;
+    if affected == 0 {
+        return Err(EnvsGateError::InvalidInput(
+            "Database not initialized".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn upsert_env_var(
     conn: &Connection,
     key: &str,
