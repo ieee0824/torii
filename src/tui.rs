@@ -9,6 +9,11 @@ fn io_err(e: dialoguer::Error) -> EnvsGateError {
 }
 
 pub fn run_interactive(db_path: &str, log_path: Option<&str>) -> Result<()> {
+    let mut log: Option<Logger> = match log_path {
+        Some(p) => Some(Logger::open(p)?),
+        None => None,
+    };
+
     let password: String = Password::new()
         .with_prompt("Password")
         .interact()
@@ -18,11 +23,14 @@ pub fn run_interactive(db_path: &str, log_path: Option<&str>) -> Result<()> {
     let conn = db::open_or_create_db(db_path)?;
     if db::is_initialized(&conn)? {
         let meta = db::load_metadata(&conn)?.unwrap();
-        crypto::unwrap_dek(&password, &meta)?;
+        if let Err(e) = crypto::unwrap_dek(&password, &meta) {
+            if let Some(l) = &mut log {
+                l.log_auth_failed();
+            }
+            return Err(e);
+        }
     }
     drop(conn);
-
-    let mut log = log_path.and_then(|p| Logger::open(p).ok());
 
     loop {
         let actions = &[

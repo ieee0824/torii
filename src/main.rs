@@ -18,18 +18,40 @@ fn prompt_password() -> error::Result<String> {
         .map_err(|e| error::EnvsGateError::InvalidInput(format!("Password prompt failed: {e}")))
 }
 
-fn open_logger(log_path: &Option<String>) -> Option<logger::Logger> {
-    log_path
-        .as_deref()
-        .and_then(|p| logger::Logger::open(p).ok())
+fn resolve_log_path(cli_log_path: &Option<String>) -> String {
+    cli_log_path
+        .clone()
+        .unwrap_or_else(logger::default_log_path)
+}
+
+fn open_logger(log_path: &str) -> error::Result<logger::Logger> {
+    logger::Logger::open(log_path)
+}
+
+/// Unwrap DEK with auth failure logging
+fn unwrap_dek_logged(
+    password: &str,
+    meta: &db::VaultMetadata,
+    log: &mut Option<logger::Logger>,
+) -> error::Result<[u8; 32]> {
+    match crypto::unwrap_dek(password, meta) {
+        Ok(dek) => Ok(dek),
+        Err(e) => {
+            if let Some(l) = log {
+                l.log_auth_failed();
+            }
+            Err(e)
+        }
+    }
 }
 
 fn main() -> error::Result<()> {
     let cli = Cli::parse();
-    let mut log = open_logger(&cli.log_path);
+    let log_path = resolve_log_path(&cli.log_path);
+    let mut log = Some(open_logger(&log_path)?);
 
     match cli.command {
-        None => return tui::run_interactive(&cli.db_path, cli.log_path.as_deref()),
+        None => return tui::run_interactive(&cli.db_path, Some(&log_path)),
         Some(Commands::Set { key_value, expires }) => {
             let mut password = prompt_password()?;
             let result = cmd_set(
@@ -67,9 +89,6 @@ fn main() -> error::Result<()> {
             result?;
         }
         Some(Commands::Logs { format }) => {
-            let log_path = cli.log_path.as_deref().ok_or_else(|| {
-                error::EnvsGateError::InvalidInput("--log-path is required for logs command".into())
-            })?;
             let fmt = match format.as_str() {
                 "json" => logger::LogFormat::Json,
                 "tsv" => logger::LogFormat::Tsv,
@@ -79,7 +98,7 @@ fn main() -> error::Result<()> {
                     ));
                 }
             };
-            logger::read_logs(log_path, fmt)?;
+            logger::read_logs(&log_path, fmt)?;
         }
     }
 
@@ -162,7 +181,7 @@ pub fn cmd_set(
     let conn = db::open_or_create_db(db_path)?;
 
     let dek = if db::is_initialized(&conn)? {
-        crypto::unwrap_dek(password, &db::load_metadata(&conn)?.unwrap())?
+        unwrap_dek_logged(password, &db::load_metadata(&conn)?.unwrap(), log)?
     } else {
         let (vault_meta, dek) = crypto::init_vault(password)?;
         db::store_metadata(&conn, &vault_meta)?;
@@ -193,7 +212,7 @@ pub fn cmd_get(
     let conn = db::open_or_create_db(db_path)?;
     let meta = db::load_metadata(&conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
-    let dek = crypto::unwrap_dek(password, &meta)?;
+    let dek = unwrap_dek_logged(password, &meta, log)?;
 
     let var = db::get_env_var(&conn, key)?
         .ok_or_else(|| error::EnvsGateError::KeyNotFound(key.into()))?;
@@ -228,7 +247,7 @@ pub fn cmd_list(
     let conn = db::open_or_create_db(db_path)?;
     let meta = db::load_metadata(&conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
-    let dek = crypto::unwrap_dek(password, &meta)?;
+    let dek = unwrap_dek_logged(password, &meta, log)?;
 
     let vars = db::list_env_vars(&conn)?;
 
@@ -272,7 +291,7 @@ pub fn cmd_delete(
     let meta = db::load_metadata(&conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
     // Verify password
-    let _dek = crypto::unwrap_dek(password, &meta)?;
+    let _dek = unwrap_dek_logged(password, &meta, log)?;
 
     if db::delete_env_var(&conn, key)? {
         if let Some(l) = log {
@@ -296,13 +315,16 @@ pub fn cmd_serve(
     let conn = db::open_or_create_db(db_path)?;
     let meta = db::load_metadata(&conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
-    let dek = crypto::unwrap_dek(password, &meta)?;
+    let dek = unwrap_dek_logged(password, &meta, log)?;
 
     let vars = db::list_env_vars(&conn)?;
     for var in &vars {
         if let Some(ref exp) = var.expires_at
             && is_expired(exp)
         {
+            if let Some(l) = log {
+                l.log_expired(&var.key_name);
+            }
             return Err(error::EnvsGateError::KeyExpired {
                 key: var.key_name.clone(),
                 expired_at: exp.clone(),

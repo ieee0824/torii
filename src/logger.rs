@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use chrono::Local;
@@ -8,6 +8,16 @@ use serde::{Deserialize, Serialize};
 use crate::error::{EnvsGateError, Result};
 
 const MAX_LOG_SIZE: u64 = 10 * 1024 * 1024; // 10MB
+
+/// Default log path
+pub fn default_log_path() -> String {
+    if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        format!("{home}/.torii/audit.log")
+    } else {
+        "torii-audit.log".into()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -48,14 +58,33 @@ pub struct Logger {
     path: String,
 }
 
+use std::os::unix::fs::OpenOptionsExt;
+
 impl Logger {
     pub fn open(path: &str) -> Result<Self> {
+        // Ensure parent directory exists
+        if let Some(parent) = Path::new(path).parent()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                EnvsGateError::InvalidInput(format!("Cannot create log directory: {e}"))
+            })?;
+        }
+
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
             .open(path)
             .map_err(|e| EnvsGateError::InvalidInput(format!("Cannot open log file: {e}")))?;
+
+        // Enforce permissions on pre-existing files
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            let _ = std::fs::set_permissions(path, perms);
+        }
 
         Ok(Self {
             file,
@@ -71,86 +100,78 @@ impl Logger {
 
         if metadata.len() >= MAX_LOG_SIZE {
             let rotated = format!("{}.old", self.path);
-            let _ = std::fs::rename(&self.path, &rotated);
+            std::fs::rename(&self.path, &rotated).map_err(|e| {
+                EnvsGateError::InvalidInput(format!("Log rotate rename failed: {e}"))
+            })?;
 
             self.file = OpenOptions::new()
                 .create(true)
                 .append(true)
                 .mode(0o600)
                 .open(&self.path)
-                .map_err(|e| EnvsGateError::InvalidInput(format!("Log rotate: {e}")))?;
+                .map_err(|e| EnvsGateError::InvalidInput(format!("Log rotate open: {e}")))?;
         }
 
         Ok(())
     }
 
     fn write_entry(&mut self, entry: &LogEntry) -> Result<()> {
-        let _ = self.check_rotate();
+        if let Err(e) = self.check_rotate() {
+            eprintln!("Warning: log rotation failed: {e}");
+        }
 
-        let json = serde_json::to_string(entry)
+        let mut json = serde_json::to_string(entry)
             .map_err(|e| EnvsGateError::InvalidInput(format!("JSON serialize: {e}")))?;
-        writeln!(self.file, "{json}")
+        json.push('\n');
+
+        // Single write call for atomicity on append-mode files
+        use std::io::Write;
+        self.file
+            .write_all(json.as_bytes())
             .map_err(|e| EnvsGateError::InvalidInput(format!("Log write: {e}")))?;
+
         Ok(())
+    }
+
+    fn log(&mut self, entry: &LogEntry) {
+        if let Err(e) = self.write_entry(entry) {
+            eprintln!("Warning: audit log write failed: {e}");
+        }
     }
 
     pub fn log_set(&mut self, key: &str, expires: Option<&str>) {
         let detail = expires.map(|e| format!("expires={e}"));
-        let entry = LogEntry::new("set", Some(key), detail.as_deref());
-        if let Err(e) = self.write_entry(&entry) {
-            eprintln!("Warning: audit log write failed: {e}");
-        }
+        self.log(&LogEntry::new("set", Some(key), detail.as_deref()));
     }
 
     pub fn log_get(&mut self, key: &str) {
-        let entry = LogEntry::new("get", Some(key), None);
-        if let Err(e) = self.write_entry(&entry) {
-            eprintln!("Warning: audit log write failed: {e}");
-        }
+        self.log(&LogEntry::new("get", Some(key), None));
     }
 
     pub fn log_list(&mut self) {
-        let entry = LogEntry::new("list", None, None);
-        if let Err(e) = self.write_entry(&entry) {
-            eprintln!("Warning: audit log write failed: {e}");
-        }
+        self.log(&LogEntry::new("list", None, None));
     }
 
     pub fn log_delete(&mut self, key: &str) {
-        let entry = LogEntry::new("delete", Some(key), None);
-        if let Err(e) = self.write_entry(&entry) {
-            eprintln!("Warning: audit log write failed: {e}");
-        }
+        self.log(&LogEntry::new("delete", Some(key), None));
     }
 
     pub fn log_serve(&mut self, env_path: &str, once: bool) {
         let detail = format!("path={env_path}, once={once}");
-        let entry = LogEntry::new("serve", None, Some(&detail));
-        if let Err(e) = self.write_entry(&entry) {
-            eprintln!("Warning: audit log write failed: {e}");
-        }
+        self.log(&LogEntry::new("serve", None, Some(&detail)));
     }
 
     pub fn log_serve_read(&mut self, keys_count: usize) {
         let detail = format!("keys_served={keys_count}");
-        let entry = LogEntry::new("serve_read", None, Some(&detail));
-        if let Err(e) = self.write_entry(&entry) {
-            eprintln!("Warning: audit log write failed: {e}");
-        }
+        self.log(&LogEntry::new("serve_read", None, Some(&detail)));
     }
 
     pub fn log_auth_failed(&mut self) {
-        let entry = LogEntry::new("auth_failed", None, None);
-        if let Err(e) = self.write_entry(&entry) {
-            eprintln!("Warning: audit log write failed: {e}");
-        }
+        self.log(&LogEntry::new("auth_failed", None, None));
     }
 
     pub fn log_expired(&mut self, key: &str) {
-        let entry = LogEntry::new("expired", Some(key), None);
-        if let Err(e) = self.write_entry(&entry) {
-            eprintln!("Warning: audit log write failed: {e}");
-        }
+        self.log(&LogEntry::new("expired", Some(key), None));
     }
 }
 
@@ -177,22 +198,28 @@ pub fn read_logs(path: &str, format: LogFormat) -> Result<()> {
         let line = line.map_err(|e| EnvsGateError::InvalidInput(format!("Read error: {e}")))?;
         match format {
             LogFormat::Json => println!("{line}"),
-            LogFormat::Tsv => {
-                if let Ok(entry) = serde_json::from_str::<LogEntry>(&line) {
-                    println!("{}", entry.to_tsv());
+            LogFormat::Tsv => match serde_json::from_str::<LogEntry>(&line) {
+                Ok(entry) => println!("{}", entry.to_tsv()),
+                Err(e) => {
+                    eprintln!("Warning: failed to parse log line: {e}");
+                    println!("N/A\tparse_error\t-\t{}", sanitize_tsv(&line));
                 }
-            }
+            },
         }
     }
 
     Ok(())
 }
 
-use std::os::unix::fs::OpenOptionsExt;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_log_path_is_set() {
+        let path = default_log_path();
+        assert!(path.contains("torii"));
+    }
 
     #[test]
     fn log_entry_to_tsv() {
@@ -220,7 +247,6 @@ mod tests {
         );
         let tsv = entry.to_tsv();
         assert!(!tsv.contains('\n'));
-        // Only tabs as TSV delimiters (3 tabs for 4 fields)
         assert_eq!(tsv.matches('\t').count(), 3);
     }
 
@@ -285,6 +311,19 @@ mod tests {
     }
 
     #[test]
+    fn logger_creates_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("subdir/nested/test.log");
+        let log_path_str = log_path.to_str().unwrap();
+
+        let mut logger = Logger::open(log_path_str).unwrap();
+        logger.log_list();
+        drop(logger);
+
+        assert!(log_path.exists());
+    }
+
+    #[test]
     fn read_logs_tsv_format() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("test.log");
@@ -301,5 +340,11 @@ mod tests {
     #[test]
     fn read_logs_nonexistent_file() {
         assert!(read_logs("/tmp/nonexistent-torii-log-12345", LogFormat::Json).is_err());
+    }
+
+    #[test]
+    fn open_logger_fails_on_invalid_path() {
+        let result = Logger::open("/nonexistent/dir/that/shouldnt/exist/log.txt");
+        assert!(result.is_err());
     }
 }
