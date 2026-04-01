@@ -79,6 +79,12 @@ torii delete -p <password> <NAME>
 torii serve -p <password> -e .env
 ```
 
+1回読まれたら自動終了:
+
+```
+torii serve -p <password> -e .env --once
+```
+
 Named pipe（FIFO）として指定パスに仮想`.env`ファイルを作成する。
 `cat`やアプリケーションから読み取ると、その瞬間に復号された環境変数が返される。
 ディスクに平文は残らない。Ctrl+Cで停止・パイプ削除。
@@ -96,6 +102,7 @@ Named pipe（FIFO）として指定パスに仮想`.env`ファイルを作成す
 | `-p, --password <pw>` | 暗号化パスワード | （必須） |
 | `--expires <duration>` | 有効期限（`set`時） | なし |
 | `-e, --env-path <path>` | 仮想.envのパス（`serve`時） | `.env` |
+| `--once` | 1回読まれたら終了（`serve`時） | off |
 
 ## 有効期限
 

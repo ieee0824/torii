@@ -58,5 +58,9 @@ pub enum Commands {
         /// Path for the virtual .env file
         #[arg(short = 'e', long = "env-path", default_value = ".env")]
         env_path: String,
+
+        /// Exit after the first read
+        #[arg(long)]
+        once: bool,
     },
 }

@@ -33,7 +33,7 @@ fn generate_env_content(db_path: &str, dek: &[u8; 32]) -> Result<Vec<u8>> {
     Ok(content.into_bytes())
 }
 
-pub fn serve(db_path: &str, dek: &[u8; 32], env_path: &str) -> Result<()> {
+pub fn serve(db_path: &str, dek: &[u8; 32], env_path: &str, once: bool) -> Result<()> {
     let path = Path::new(env_path);
 
     // Resolve to absolute path
@@ -95,6 +95,9 @@ pub fn serve(db_path: &str, dek: &[u8; 32], env_path: &str) -> Result<()> {
                     }
                 }
                 // f is dropped here, closing the write end → reader gets EOF
+                if once {
+                    break;
+                }
             }
             Err(e) => {
                 // FIFO was removed or other error

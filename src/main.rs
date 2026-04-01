@@ -22,7 +22,7 @@ fn main() -> error::Result<()> {
         Some(Commands::Get { password, key }) => cmd_get(&cli.db_path, &password, &key)?,
         Some(Commands::List { password }) => cmd_list(&cli.db_path, &password)?,
         Some(Commands::Delete { password, key }) => cmd_delete(&cli.db_path, &password, &key)?,
-        Some(Commands::Serve { password, env_path }) => cmd_serve(&cli.db_path, &password, &env_path)?,
+        Some(Commands::Serve { password, env_path, once }) => cmd_serve(&cli.db_path, &password, &env_path, once)?,
     }
 
     Ok(())
@@ -185,7 +185,7 @@ pub fn cmd_delete(db_path: &str, password: &str, key: &str) -> error::Result<()>
     Ok(())
 }
 
-pub fn cmd_serve(db_path: &str, password: &str, env_path: &str) -> error::Result<()> {
+pub fn cmd_serve(db_path: &str, password: &str, env_path: &str, once: bool) -> error::Result<()> {
     let conn = db::open_or_create_db(db_path)?;
     let meta = db::load_metadata(&conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
@@ -203,5 +203,5 @@ pub fn cmd_serve(db_path: &str, password: &str, env_path: &str) -> error::Result
         }
     }
 
-    fuse_fs::serve(db_path, &dek, env_path)
+    fuse_fs::serve(db_path, &dek, env_path, once)
 }

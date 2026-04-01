@@ -125,5 +125,11 @@ fn interactive_serve(db_path: &str, password: &str) -> Result<()> {
         .interact_text()
         .map_err(io_err)?;
 
-    cmd_serve(db_path, password, &env_path)
+    let once = Confirm::new()
+        .with_prompt("Exit after first read?")
+        .default(true)
+        .interact()
+        .map_err(io_err)?;
+
+    cmd_serve(db_path, password, &env_path, once)
 }
