@@ -492,8 +492,9 @@ pub fn cmd_rotate_password(
     let meta = db::load_metadata(&conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
 
-    let dek = unwrap_dek_logged(old_password, &meta, log)?;
+    let mut dek = unwrap_dek_logged(old_password, &meta, log)?;
     let new_meta = crypto::wrap_dek(new_password, &dek)?;
+    dek.zeroize();
 
     db::update_metadata(&conn, &new_meta)?;
 
@@ -514,7 +515,7 @@ pub fn cmd_rotate_dek(
     let meta = db::load_metadata(&conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
 
-    let old_dek = unwrap_dek_logged(password, &meta, log)?;
+    let mut old_dek = unwrap_dek_logged(password, &meta, log)?;
 
     // Decrypt all values with old DEK
     let vars = db::list_env_vars(&conn)?;
@@ -525,12 +526,14 @@ pub fn cmd_rotate_dek(
         decrypted.push((var.key_name.clone(), plaintext, var.expires_at.clone()));
     }
 
+    old_dek.zeroize();
+
     // Generate new DEK, wrap with same password, re-encrypt all values atomically
     let tx = conn
         .unchecked_transaction()
         .map_err(|e| error::EnvsGateError::Db(e))?;
 
-    let (new_meta, new_dek) = crypto::init_vault(password)?;
+    let (new_meta, mut new_dek) = crypto::init_vault(password)?;
     db::update_metadata(&tx, &new_meta)?;
 
     for (key, mut plaintext, expires_at) in decrypted {
@@ -538,6 +541,8 @@ pub fn cmd_rotate_dek(
         db::upsert_env_var(&tx, &key, &nonce, &ciphertext, expires_at.as_deref())?;
         plaintext.zeroize();
     }
+
+    new_dek.zeroize();
 
     tx.commit().map_err(|e| error::EnvsGateError::Db(e))?;
 
