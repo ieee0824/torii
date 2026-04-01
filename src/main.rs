@@ -75,9 +75,33 @@ fn resolve_paths(
     })?;
 
     let db = format!("{ns_dir}/torii.db");
-    let log = log_path
-        .clone()
-        .unwrap_or_else(|| format!("{ns_dir}/audit.log"));
+
+    // P1: Warn if CWD has a legacy torii.db but namespace DB doesn't exist yet
+    if namespace == "default" && !std::path::Path::new(&db).exists() {
+        let legacy_db = std::path::Path::new("torii.db");
+        if legacy_db.exists() {
+            eprintln!(
+                "Warning: Found ./torii.db in current directory, but default namespace DB does not exist yet."
+            );
+            eprintln!("  To use the existing DB: torii --db-path ./torii.db <command>");
+            eprintln!("  To migrate: mv ./torii.db {db}");
+        }
+    }
+
+    // P2: Migrate legacy audit log (~/.torii/audit.log → ~/.torii/default/audit.log)
+    let ns_log = format!("{ns_dir}/audit.log");
+    if namespace == "default" && !std::path::Path::new(&ns_log).exists() {
+        let legacy_log = format!("{torii_home}/audit.log");
+        if std::path::Path::new(&legacy_log).exists() {
+            if let Err(e) = std::fs::rename(&legacy_log, &ns_log) {
+                eprintln!("Warning: Failed to migrate audit log: {e}");
+            } else {
+                eprintln!("Migrated audit log: {legacy_log} → {ns_log}");
+            }
+        }
+    }
+
+    let log = log_path.clone().unwrap_or(ns_log);
 
     Ok((db, log))
 }
