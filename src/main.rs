@@ -794,7 +794,8 @@ mod tests {
         drop(log);
 
         let content = std::fs::read_to_string(&log_path).unwrap();
-        let entry: logger::LogEntry = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        let entry: logger::LogEntry =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert_eq!(entry.action, "exec");
         assert!(entry.detail.unwrap().contains("keys_injected=2"));
     }
