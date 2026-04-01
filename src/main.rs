@@ -244,3 +244,204 @@ pub fn cmd_serve(db_path: &str, password: &str, env_path: &str, once: bool) -> e
 
     fuse_fs::serve(db_path, &dek, env_path, once)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- parse_expires: 正常系 ---
+
+    #[test]
+    fn parse_expires_seconds() {
+        let result = parse_expires("30s").unwrap();
+        assert!(result.contains("T"));
+        chrono::NaiveDateTime::parse_from_str(&result, "%Y-%m-%dT%H:%M:%S").unwrap();
+    }
+
+    #[test]
+    fn parse_expires_minutes() {
+        let result = parse_expires("5m").unwrap();
+        chrono::NaiveDateTime::parse_from_str(&result, "%Y-%m-%dT%H:%M:%S").unwrap();
+    }
+
+    #[test]
+    fn parse_expires_hours() {
+        let result = parse_expires("1h").unwrap();
+        chrono::NaiveDateTime::parse_from_str(&result, "%Y-%m-%dT%H:%M:%S").unwrap();
+    }
+
+    #[test]
+    fn parse_expires_days() {
+        let result = parse_expires("7d").unwrap();
+        chrono::NaiveDateTime::parse_from_str(&result, "%Y-%m-%dT%H:%M:%S").unwrap();
+    }
+
+    #[test]
+    fn parse_expires_absolute_date() {
+        let result = parse_expires("2030-06-15").unwrap();
+        assert_eq!(result, "2030-06-15T23:59:59");
+    }
+
+    #[test]
+    fn parse_expires_absolute_datetime() {
+        let result = parse_expires("2030-06-15T12:30:00").unwrap();
+        assert_eq!(result, "2030-06-15T12:30:00");
+    }
+
+    #[test]
+    fn parse_expires_with_whitespace() {
+        let result = parse_expires("  1h  ").unwrap();
+        chrono::NaiveDateTime::parse_from_str(&result, "%Y-%m-%dT%H:%M:%S").unwrap();
+    }
+
+    // --- parse_expires: 異常系 ---
+
+    #[test]
+    fn parse_expires_invalid_format() {
+        assert!(parse_expires("abc").is_err());
+    }
+
+    #[test]
+    fn parse_expires_empty() {
+        assert!(parse_expires("").is_err());
+    }
+
+    #[test]
+    fn parse_expires_invalid_unit() {
+        assert!(parse_expires("5x").is_err());
+    }
+
+    #[test]
+    fn parse_expires_invalid_date() {
+        assert!(parse_expires("2030-13-01").is_err());
+    }
+
+    #[test]
+    fn parse_expires_invalid_datetime() {
+        assert!(parse_expires("2030-01-01T25:00:00").is_err());
+    }
+
+    // --- is_expired: 正常系 ---
+
+    #[test]
+    fn is_expired_past_datetime() {
+        assert!(is_expired("2000-01-01T00:00:00"));
+    }
+
+    #[test]
+    fn is_expired_future_datetime() {
+        assert!(!is_expired("2099-12-31T23:59:59"));
+    }
+
+    #[test]
+    fn is_expired_past_date() {
+        assert!(is_expired("2000-01-01"));
+    }
+
+    #[test]
+    fn is_expired_future_date() {
+        assert!(!is_expired("2099-12-31"));
+    }
+
+    // --- is_expired: 異常系 ---
+
+    #[test]
+    fn is_expired_invalid_format_returns_false() {
+        assert!(!is_expired("not-a-date"));
+    }
+
+    #[test]
+    fn is_expired_empty_returns_false() {
+        assert!(!is_expired(""));
+    }
+
+    // --- cmd_set / cmd_get / cmd_delete 統合テスト ---
+
+    #[test]
+    fn set_get_delete_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "MY_KEY=my_value", None).unwrap();
+
+        let conn = db::open_or_create_db(db_path).unwrap();
+        let meta = db::load_metadata(&conn).unwrap().unwrap();
+        let dek = crypto::unwrap_dek("pw", &meta).unwrap();
+        let var = db::get_env_var(&conn, "MY_KEY").unwrap().unwrap();
+        let plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext).unwrap();
+        assert_eq!(plaintext, b"my_value");
+
+        cmd_delete(db_path, "pw", "MY_KEY").unwrap();
+        assert!(db::get_env_var(&conn, "MY_KEY").unwrap().is_none());
+    }
+
+    #[test]
+    fn set_with_wrong_password_on_existing_db_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "correct", "K=V", None).unwrap();
+        let result = cmd_set(db_path, "wrong", "K2=V2", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn get_nonexistent_key_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "EXISTS=yes", None).unwrap();
+        let result = cmd_get(db_path, "pw", "NOPE");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn get_expired_key_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "OLD=val", Some("2000-01-01")).unwrap();
+        let result = cmd_get(db_path, "pw", "OLD");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn delete_nonexistent_key_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "K=V", None).unwrap();
+        let result = cmd_delete(db_path, "pw", "MISSING");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn set_invalid_key_value_format_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        let result = cmd_set(db_path, "pw", "NO_EQUALS_SIGN", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn set_with_expires_stores_datetime() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "K=V", Some("1h")).unwrap();
+
+        let conn = db::open_or_create_db(db_path).unwrap();
+        let var = db::get_env_var(&conn, "K").unwrap().unwrap();
+        assert!(var.expires_at.is_some());
+        let exp = var.expires_at.unwrap();
+        chrono::NaiveDateTime::parse_from_str(&exp, "%Y-%m-%dT%H:%M:%S").unwrap();
+    }
+}
