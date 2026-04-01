@@ -88,6 +88,12 @@ fn main() -> error::Result<()> {
             password.zeroize();
             result?;
         }
+        Some(Commands::Exec { command }) => {
+            let mut password = prompt_password()?;
+            let result = cmd_exec(&cli.db_path, &password, &command, &mut log);
+            password.zeroize();
+            result?;
+        }
         Some(Commands::Logs { format }) => {
             let fmt = match format.as_str() {
                 "json" => logger::LogFormat::Json,
@@ -339,6 +345,64 @@ pub fn cmd_serve(
     fuse_fs::serve(db_path, &dek, env_path, once)
 }
 
+pub fn cmd_exec(
+    db_path: &str,
+    password: &str,
+    command: &[String],
+    log: &mut Option<logger::Logger>,
+) -> error::Result<()> {
+    if command.is_empty() {
+        return Err(error::EnvsGateError::InvalidInput(
+            "No command specified".into(),
+        ));
+    }
+
+    let conn = db::open_or_create_db(db_path)?;
+    let meta = db::load_metadata(&conn)?
+        .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
+    let dek = unwrap_dek_logged(password, &meta, log)?;
+
+    let vars = db::list_env_vars(&conn)?;
+    let mut env_pairs = Vec::new();
+
+    for var in &vars {
+        if let Some(ref exp) = var.expires_at
+            && is_expired(exp)
+        {
+            if let Some(l) = log {
+                l.log_expired(&var.key_name);
+            }
+            return Err(error::EnvsGateError::KeyExpired {
+                key: var.key_name.clone(),
+                expired_at: exp.clone(),
+            });
+        }
+
+        let mut plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
+        let value = String::from_utf8_lossy(&plaintext).to_string();
+        env_pairs.push((var.key_name.clone(), value));
+        plaintext.zeroize();
+    }
+
+    if let Some(l) = log {
+        let detail = format!("cmd={}, keys_injected={}", command[0], env_pairs.len());
+        l.log_serve(&detail, false);
+    }
+
+    let program = &command[0];
+    let args = &command[1..];
+
+    let status = std::process::Command::new(program)
+        .args(args)
+        .envs(env_pairs)
+        .status()
+        .map_err(|e| {
+            error::EnvsGateError::InvalidInput(format!("Failed to execute '{program}': {e}"))
+        })?;
+
+    std::process::exit(status.code().unwrap_or(1));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,5 +629,55 @@ mod tests {
             .map(|l| serde_json::from_str::<logger::LogEntry>(l).unwrap().action)
             .collect();
         assert_eq!(actions, vec!["set", "get", "list", "delete"]);
+    }
+
+    // --- exec テスト ---
+
+    #[test]
+    fn exec_empty_command_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
+        let result = cmd_exec(db_path, "pw", &[], &mut None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exec_wrong_password_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
+        let result = cmd_exec(
+            db_path,
+            "wrong",
+            &["echo".into(), "hello".into()],
+            &mut None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exec_with_expired_key_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "OLD=val", Some("2000-01-01"), &mut None).unwrap();
+        let result = cmd_exec(db_path, "pw", &["echo".into()], &mut None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exec_uninitialized_db_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        let result = cmd_exec(db_path, "pw", &["echo".into()], &mut None);
+        assert!(result.is_err());
     }
 }

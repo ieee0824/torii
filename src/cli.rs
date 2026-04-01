@@ -56,6 +56,13 @@ pub enum Commands {
         once: bool,
     },
 
+    /// Execute a command with decrypted environment variables injected
+    Exec {
+        /// Command and arguments to execute
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
+
     /// View audit logs
     Logs {
         /// Output format
