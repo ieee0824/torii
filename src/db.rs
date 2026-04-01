@@ -233,7 +233,14 @@ mod tests {
     fn upsert_overwrites_existing() {
         let conn = test_db();
         upsert_env_var(&conn, "KEY1", b"nonce1_12byte", b"value1", None).unwrap();
-        upsert_env_var(&conn, "KEY1", b"nonce2_12byte", b"value2", Some("2030-01-01")).unwrap();
+        upsert_env_var(
+            &conn,
+            "KEY1",
+            b"nonce2_12byte",
+            b"value2",
+            Some("2030-01-01"),
+        )
+        .unwrap();
 
         let var = get_env_var(&conn, "KEY1").unwrap().unwrap();
         assert_eq!(var.ciphertext, b"value2");
@@ -281,7 +288,14 @@ mod tests {
     #[test]
     fn env_var_with_expires() {
         let conn = test_db();
-        upsert_env_var(&conn, "TEMP", b"nonce_12bytes", b"val", Some("2025-12-31T23:59:59")).unwrap();
+        upsert_env_var(
+            &conn,
+            "TEMP",
+            b"nonce_12bytes",
+            b"val",
+            Some("2025-12-31T23:59:59"),
+        )
+        .unwrap();
         let var = get_env_var(&conn, "TEMP").unwrap().unwrap();
         assert_eq!(var.expires_at.as_deref(), Some("2025-12-31T23:59:59"));
     }
