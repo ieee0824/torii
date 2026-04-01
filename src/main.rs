@@ -18,6 +18,21 @@ fn prompt_password() -> error::Result<String> {
         .map_err(|e| error::EnvsGateError::InvalidInput(format!("Password prompt failed: {e}")))
 }
 
+fn prompt_password_with_message(msg: &str) -> error::Result<String> {
+    dialoguer::Password::new()
+        .with_prompt(msg)
+        .interact()
+        .map_err(|e| error::EnvsGateError::InvalidInput(format!("Password prompt failed: {e}")))
+}
+
+fn prompt_new_password() -> error::Result<String> {
+    dialoguer::Password::new()
+        .with_prompt("New password")
+        .with_confirmation("Confirm new password", "Passwords do not match")
+        .interact()
+        .map_err(|e| error::EnvsGateError::InvalidInput(format!("Password prompt failed: {e}")))
+}
+
 fn resolve_log_path(cli_log_path: &Option<String>) -> String {
     cli_log_path
         .clone()
@@ -94,6 +109,21 @@ fn main() -> error::Result<()> {
             password.zeroize();
             let code = result?;
             std::process::exit(code);
+        }
+        Some(Commands::RotatePassword) => {
+            let old_password = prompt_password_with_message("Old password: ")?;
+            let mut new_password = prompt_new_password()?;
+            let mut old_pw = old_password;
+            let result = cmd_rotate_password(&cli.db_path, &old_pw, &new_password, &mut log);
+            old_pw.zeroize();
+            new_password.zeroize();
+            result?;
+        }
+        Some(Commands::RotateDek) => {
+            let mut password = prompt_password()?;
+            let result = cmd_rotate_dek(&cli.db_path, &password, &mut log);
+            password.zeroize();
+            result?;
         }
         Some(Commands::Logs { format }) => {
             let fmt = match format.as_str() {
@@ -452,6 +482,86 @@ pub fn cmd_exec(
         .unwrap_or_else(|| status.signal().map_or(1, |sig| 128 + sig)))
 }
 
+pub fn cmd_rotate_password(
+    db_path: &str,
+    old_password: &str,
+    new_password: &str,
+    log: &mut Option<logger::Logger>,
+) -> error::Result<()> {
+    let conn = db::open_or_create_db(db_path)?;
+    let meta = db::load_metadata(&conn)?
+        .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
+
+    let mut dek = unwrap_dek_logged(old_password, &meta, log)?;
+    let new_meta = crypto::wrap_dek(new_password, &dek)?;
+    dek.zeroize();
+
+    db::update_metadata(&conn, &new_meta)?;
+
+    if let Some(l) = log {
+        l.log_rotate_password();
+    }
+
+    eprintln!("Password rotated successfully");
+    Ok(())
+}
+
+pub fn cmd_rotate_dek(
+    db_path: &str,
+    password: &str,
+    log: &mut Option<logger::Logger>,
+) -> error::Result<()> {
+    let mut conn = db::open_or_create_db(db_path)?;
+    let meta = db::load_metadata(&conn)?
+        .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
+
+    let mut old_dek = unwrap_dek_logged(password, &meta, log)?;
+
+    // IMMEDIATE transaction to prevent concurrent writes during rotation
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(error::EnvsGateError::Db)?;
+
+    // Decrypt all values with old DEK (inside transaction for consistency)
+    let vars = db::list_env_vars(&tx)?;
+    let mut decrypted: Vec<(String, zeroize::Zeroizing<Vec<u8>>, Option<String>)> = Vec::new();
+
+    for var in &vars {
+        let plaintext = crypto::decrypt_value(&old_dek, &var.nonce, &var.ciphertext)?;
+        decrypted.push((
+            var.key_name.clone(),
+            zeroize::Zeroizing::new(plaintext),
+            var.expires_at.clone(),
+        ));
+    }
+
+    old_dek.zeroize();
+
+    // Generate new DEK, wrap with same password, re-encrypt all values
+    let (new_meta, mut new_dek) = crypto::init_vault(password)?;
+    db::update_metadata(&tx, &new_meta)?;
+
+    for (key, plaintext, expires_at) in &decrypted {
+        let (nonce, ciphertext) = crypto::encrypt_value(&new_dek, plaintext)?;
+        db::upsert_env_var(&tx, key, &nonce, &ciphertext, expires_at.as_deref())?;
+    }
+
+    new_dek.zeroize();
+    drop(decrypted);
+
+    tx.commit().map_err(error::EnvsGateError::Db)?;
+
+    if let Some(l) = log {
+        l.log_rotate_dek(vars.len());
+    }
+
+    eprintln!(
+        "DEK rotated successfully ({} values re-encrypted)",
+        vars.len()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -776,6 +886,200 @@ mod tests {
         let cmd = vec!["sh".into(), "-c".into(), "kill -9 $$".into()];
         let code = cmd_exec(db_path, "pw", &cmd, &mut None).unwrap();
         assert_eq!(code, 137);
+    }
+
+    // --- rotate-password テスト ---
+
+    fn decrypt_var(db_path: &str, password: &str, key: &str) -> String {
+        let conn = db::open_or_create_db(db_path).unwrap();
+        let meta = db::load_metadata(&conn).unwrap().unwrap();
+        let dek = crypto::unwrap_dek(password, &meta).unwrap();
+        let var = db::get_env_var(&conn, key).unwrap().unwrap();
+        let plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext).unwrap();
+        String::from_utf8(plaintext).unwrap()
+    }
+
+    #[test]
+    fn rotate_password_changes_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "old_pw", "SECRET=hello", None, &mut None).unwrap();
+
+        cmd_rotate_password(db_path, "old_pw", "new_pw", &mut None).unwrap();
+
+        // Old password should fail
+        let conn = db::open_or_create_db(db_path).unwrap();
+        let meta = db::load_metadata(&conn).unwrap().unwrap();
+        assert!(crypto::unwrap_dek("old_pw", &meta).is_err());
+
+        // New password should work
+        assert_eq!(decrypt_var(db_path, "new_pw", "SECRET"), "hello");
+    }
+
+    #[test]
+    fn rotate_password_wrong_old_password_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
+
+        let result = cmd_rotate_password(db_path, "wrong", "new_pw", &mut None);
+        assert!(result.is_err());
+
+        // Original password should still work
+        assert_eq!(decrypt_var(db_path, "pw", "K"), "V");
+    }
+
+    #[test]
+    fn rotate_password_uninitialized_db_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        let result = cmd_rotate_password(db_path, "old", "new", &mut None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rotate_password_preserves_multiple_vars() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "A=1", None, &mut None).unwrap();
+        cmd_set(db_path, "pw", "B=2", None, &mut None).unwrap();
+        cmd_set(db_path, "pw", "C=3", Some("2099-12-31"), &mut None).unwrap();
+
+        cmd_rotate_password(db_path, "pw", "new_pw", &mut None).unwrap();
+
+        assert_eq!(decrypt_var(db_path, "new_pw", "A"), "1");
+        assert_eq!(decrypt_var(db_path, "new_pw", "B"), "2");
+        assert_eq!(decrypt_var(db_path, "new_pw", "C"), "3");
+    }
+
+    #[test]
+    fn rotate_password_logs_audit_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+        let log_path = dir.path().join("audit.log");
+
+        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
+
+        let mut log = Some(logger::Logger::open(log_path.to_str().unwrap()).unwrap());
+        cmd_rotate_password(db_path, "pw", "new_pw", &mut log).unwrap();
+        drop(log);
+
+        let content = std::fs::read_to_string(&log_path).unwrap();
+        let entry: logger::LogEntry =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(entry.action, "rotate_password");
+    }
+
+    // --- rotate-dek テスト ---
+
+    #[test]
+    fn rotate_dek_reencrypts_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "SECRET=hello", None, &mut None).unwrap();
+
+        // Save old ciphertext
+        let conn = db::open_or_create_db(db_path).unwrap();
+        let old_var = db::get_env_var(&conn, "SECRET").unwrap().unwrap();
+        let old_ciphertext = old_var.ciphertext.clone();
+        let old_nonce = old_var.nonce.clone();
+        drop(conn);
+
+        cmd_rotate_dek(db_path, "pw", &mut None).unwrap();
+
+        // Value should still be readable
+        assert_eq!(decrypt_var(db_path, "pw", "SECRET"), "hello");
+
+        // Ciphertext should have changed (new DEK + new nonce)
+        let conn = db::open_or_create_db(db_path).unwrap();
+        let new_var = db::get_env_var(&conn, "SECRET").unwrap().unwrap();
+        assert_ne!(new_var.ciphertext, old_ciphertext);
+        assert_ne!(new_var.nonce, old_nonce);
+    }
+
+    #[test]
+    fn rotate_dek_wrong_password_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
+
+        let result = cmd_rotate_dek(db_path, "wrong", &mut None);
+        assert!(result.is_err());
+
+        // Original should still work
+        assert_eq!(decrypt_var(db_path, "pw", "K"), "V");
+    }
+
+    #[test]
+    fn rotate_dek_uninitialized_db_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        let result = cmd_rotate_dek(db_path, "pw", &mut None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rotate_dek_preserves_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "K=V", Some("2099-12-31"), &mut None).unwrap();
+
+        cmd_rotate_dek(db_path, "pw", &mut None).unwrap();
+
+        let conn = db::open_or_create_db(db_path).unwrap();
+        let var = db::get_env_var(&conn, "K").unwrap().unwrap();
+        assert!(var.expires_at.unwrap().starts_with("2099-12-31"));
+    }
+
+    #[test]
+    fn rotate_dek_empty_db_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        // Initialize DB with no env vars
+        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
+        cmd_delete(db_path, "pw", "K", &mut None).unwrap();
+
+        cmd_rotate_dek(db_path, "pw", &mut None).unwrap();
+    }
+
+    #[test]
+    fn rotate_dek_logs_audit_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+        let log_path = dir.path().join("audit.log");
+
+        cmd_set(db_path, "pw", "A=1", None, &mut None).unwrap();
+        cmd_set(db_path, "pw", "B=2", None, &mut None).unwrap();
+
+        let mut log = Some(logger::Logger::open(log_path.to_str().unwrap()).unwrap());
+        cmd_rotate_dek(db_path, "pw", &mut log).unwrap();
+        drop(log);
+
+        let content = std::fs::read_to_string(&log_path).unwrap();
+        let entry: logger::LogEntry =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(entry.action, "rotate_dek");
+        assert!(entry.detail.unwrap().contains("reencrypted=2"));
     }
 
     #[test]

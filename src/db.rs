@@ -95,6 +95,27 @@ pub fn load_metadata(conn: &Connection) -> Result<Option<VaultMetadata>> {
     }
 }
 
+pub fn update_metadata(conn: &Connection, meta: &VaultMetadata) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE metadata SET salt = ?1, ek_kem = ?2, x25519_pub = ?3, ct_kem = ?4, x25519_eph = ?5, wrap_nonce = ?6, wrapped_dek = ?7 WHERE id = 1",
+        params![
+            meta.salt,
+            meta.ek_kem,
+            meta.x25519_pub,
+            meta.ct_kem,
+            meta.x25519_eph,
+            meta.wrap_nonce,
+            meta.wrapped_dek,
+        ],
+    )?;
+    if affected == 0 {
+        return Err(EnvsGateError::InvalidInput(
+            "Database not initialized".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn upsert_env_var(
     conn: &Connection,
     key: &str,
@@ -215,6 +236,51 @@ mod tests {
         };
         store_metadata(&conn, &meta).unwrap();
         assert!(store_metadata(&conn, &meta).is_err());
+    }
+
+    #[test]
+    fn update_metadata_on_uninitialized_db_fails() {
+        let conn = test_db();
+        let meta = VaultMetadata {
+            salt: vec![1; 16],
+            ek_kem: vec![2; 32],
+            x25519_pub: vec![3; 32],
+            ct_kem: vec![4; 32],
+            x25519_eph: vec![5; 32],
+            wrap_nonce: vec![6; 12],
+            wrapped_dek: vec![7; 48],
+        };
+        assert!(update_metadata(&conn, &meta).is_err());
+    }
+
+    #[test]
+    fn update_metadata_after_store_succeeds() {
+        let conn = test_db();
+        let meta = VaultMetadata {
+            salt: vec![1; 16],
+            ek_kem: vec![2; 32],
+            x25519_pub: vec![3; 32],
+            ct_kem: vec![4; 32],
+            x25519_eph: vec![5; 32],
+            wrap_nonce: vec![6; 12],
+            wrapped_dek: vec![7; 48],
+        };
+        store_metadata(&conn, &meta).unwrap();
+
+        let updated = VaultMetadata {
+            salt: vec![9; 16],
+            ek_kem: vec![8; 32],
+            x25519_pub: vec![7; 32],
+            ct_kem: vec![6; 32],
+            x25519_eph: vec![5; 32],
+            wrap_nonce: vec![4; 12],
+            wrapped_dek: vec![3; 48],
+        };
+        update_metadata(&conn, &updated).unwrap();
+
+        let loaded = load_metadata(&conn).unwrap().unwrap();
+        assert_eq!(loaded.salt, vec![9; 16]);
+        assert_eq!(loaded.wrapped_dek, vec![3; 48]);
     }
 
     #[test]

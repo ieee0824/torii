@@ -52,84 +52,23 @@ fn derive_mlkem_keypair(
 }
 
 pub fn init_vault(password: &str) -> Result<(VaultMetadata, [u8; DEK_LEN])> {
-    let mut salt = [0u8; ARGON2_SALT_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut salt);
-
-    let mut master_seed = derive_master_seed(password, &salt)?;
-
-    // Derive keypairs from master seed
-    let x25519_seed: [u8; 32] = master_seed[..32].try_into().unwrap();
-    let mlkem_seed: [u8; 32] = master_seed[32..64].try_into().unwrap();
-    master_seed.zeroize();
-
-    let (_x25519_static_secret, x25519_static_pub) = derive_x25519_static(&x25519_seed);
-    let (_dk_kem, ek_kem) = derive_mlkem_keypair(&mlkem_seed);
-
-    // Generate random DEK
     let mut dek = [0u8; DEK_LEN];
     rand::rngs::OsRng.fill_bytes(&mut dek);
-
-    // Hybrid wrap DEK
-    // 1. Ephemeral X25519
-    let x25519_eph_secret = EphemeralSecret::random_from_rng(OsRng);
-    let x25519_eph_pub = PublicKey::from(&x25519_eph_secret);
-    let ss_x25519 = x25519_eph_secret.diffie_hellman(&x25519_static_pub);
-
-    // 2. ML-KEM encapsulate
-    let (ct_kem, ss_kem) = ek_kem
-        .encapsulate(&mut OsRng)
-        .map_err(|e| EnvsGateError::Crypto(format!("ML-KEM encapsulate: {e:?}")))?;
-
-    // 3. Combine shared secrets with HKDF
-    let mut ikm = Vec::with_capacity(64);
-    ikm.extend_from_slice(ss_kem.as_ref());
-    ikm.extend_from_slice(ss_x25519.as_bytes());
-
-    let hk = Hkdf::<Sha256>::new(Some(b"torii-hybrid-wrap"), &ikm);
-    let mut wrapping_key = [0u8; 32];
-    hk.expand(b"dek-wrapping", &mut wrapping_key)
-        .map_err(|e| EnvsGateError::Crypto(format!("HKDF expand: {e}")))?;
-    ikm.zeroize();
-
-    // 4. Wrap DEK with AES-256-GCM
-    let cipher = Aes256Gcm::new_from_slice(&wrapping_key)
-        .map_err(|e| EnvsGateError::Crypto(format!("AES key: {e}")))?;
-    wrapping_key.zeroize();
-
-    let mut wrap_nonce_bytes = [0u8; AES_NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut wrap_nonce_bytes);
-    let wrap_nonce = Nonce::from_slice(&wrap_nonce_bytes);
-
-    let wrapped_dek = cipher
-        .encrypt(wrap_nonce, dek.as_ref())
-        .map_err(|e| EnvsGateError::Crypto(format!("DEK wrap: {e}")))?;
-
-    // Serialize ML-KEM encapsulation key
-    let ek_kem_bytes = ek_kem.as_bytes().to_vec();
-    let ct_kem_bytes = ct_kem.as_slice().to_vec();
-
-    let meta = VaultMetadata {
-        salt: salt.to_vec(),
-        ek_kem: ek_kem_bytes,
-        x25519_pub: x25519_static_pub.as_bytes().to_vec(),
-        ct_kem: ct_kem_bytes,
-        x25519_eph: x25519_eph_pub.as_bytes().to_vec(),
-        wrap_nonce: wrap_nonce_bytes.to_vec(),
-        wrapped_dek,
-    };
-
+    let meta = wrap_dek(password, &dek)?;
     Ok((meta, dek))
 }
 
 pub fn unwrap_dek(password: &str, meta: &VaultMetadata) -> Result<[u8; DEK_LEN]> {
     let mut master_seed = derive_master_seed(password, &meta.salt)?;
 
-    let x25519_seed: [u8; 32] = master_seed[..32].try_into().unwrap();
-    let mlkem_seed: [u8; 32] = master_seed[32..64].try_into().unwrap();
+    let mut x25519_seed: [u8; 32] = master_seed[..32].try_into().unwrap();
+    let mut mlkem_seed: [u8; 32] = master_seed[32..64].try_into().unwrap();
     master_seed.zeroize();
 
     let (x25519_static_secret, _) = derive_x25519_static(&x25519_seed);
     let (dk_kem, _) = derive_mlkem_keypair(&mlkem_seed);
+    x25519_seed.zeroize();
+    mlkem_seed.zeroize();
 
     // X25519 DH with ephemeral public key
     let x25519_eph_pub_bytes: [u8; 32] = meta
@@ -173,6 +112,66 @@ pub fn unwrap_dek(password: &str, meta: &VaultMetadata) -> Result<[u8; DEK_LEN]>
         .map_err(|_| EnvsGateError::Crypto("Invalid DEK length".into()))?;
 
     Ok(dek)
+}
+
+pub fn wrap_dek(password: &str, dek: &[u8; DEK_LEN]) -> Result<VaultMetadata> {
+    let mut salt = [0u8; ARGON2_SALT_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+
+    let mut master_seed = derive_master_seed(password, &salt)?;
+
+    let mut x25519_seed: [u8; 32] = master_seed[..32].try_into().unwrap();
+    let mut mlkem_seed: [u8; 32] = master_seed[32..64].try_into().unwrap();
+    master_seed.zeroize();
+
+    let (_x25519_static_secret, x25519_static_pub) = derive_x25519_static(&x25519_seed);
+    let (_dk_kem, ek_kem) = derive_mlkem_keypair(&mlkem_seed);
+    x25519_seed.zeroize();
+    mlkem_seed.zeroize();
+
+    // Hybrid wrap DEK
+    let x25519_eph_secret = EphemeralSecret::random_from_rng(OsRng);
+    let x25519_eph_pub = PublicKey::from(&x25519_eph_secret);
+    let ss_x25519 = x25519_eph_secret.diffie_hellman(&x25519_static_pub);
+
+    let (ct_kem, ss_kem) = ek_kem
+        .encapsulate(&mut OsRng)
+        .map_err(|e| EnvsGateError::Crypto(format!("ML-KEM encapsulate: {e:?}")))?;
+
+    let mut ikm = Vec::with_capacity(64);
+    ikm.extend_from_slice(ss_kem.as_ref());
+    ikm.extend_from_slice(ss_x25519.as_bytes());
+
+    let hk = Hkdf::<Sha256>::new(Some(b"torii-hybrid-wrap"), &ikm);
+    let mut wrapping_key = [0u8; 32];
+    hk.expand(b"dek-wrapping", &mut wrapping_key)
+        .map_err(|e| EnvsGateError::Crypto(format!("HKDF expand: {e}")))?;
+    ikm.zeroize();
+
+    let cipher = Aes256Gcm::new_from_slice(&wrapping_key)
+        .map_err(|e| EnvsGateError::Crypto(format!("AES key: {e}")))?;
+    wrapping_key.zeroize();
+
+    let mut wrap_nonce_bytes = [0u8; AES_NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut wrap_nonce_bytes);
+    let wrap_nonce = Nonce::from_slice(&wrap_nonce_bytes);
+
+    let wrapped_dek = cipher
+        .encrypt(wrap_nonce, dek.as_ref())
+        .map_err(|e| EnvsGateError::Crypto(format!("DEK wrap: {e}")))?;
+
+    let ek_kem_bytes = ek_kem.as_bytes().to_vec();
+    let ct_kem_bytes = ct_kem.as_slice().to_vec();
+
+    Ok(VaultMetadata {
+        salt: salt.to_vec(),
+        ek_kem: ek_kem_bytes,
+        x25519_pub: x25519_static_pub.as_bytes().to_vec(),
+        ct_kem: ct_kem_bytes,
+        x25519_eph: x25519_eph_pub.as_bytes().to_vec(),
+        wrap_nonce: wrap_nonce_bytes.to_vec(),
+        wrapped_dek,
+    })
 }
 
 pub fn encrypt_value(dek: &[u8; DEK_LEN], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {

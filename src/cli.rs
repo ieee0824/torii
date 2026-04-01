@@ -63,6 +63,12 @@ pub enum Commands {
         command: Vec<String>,
     },
 
+    /// Rotate password (re-wrap DEK with new password)
+    RotatePassword,
+
+    /// Rotate DEK (generate new DEK and re-encrypt all values)
+    RotateDek,
+
     /// View audit logs
     Logs {
         /// Output format
