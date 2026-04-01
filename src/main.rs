@@ -389,15 +389,15 @@ pub fn cmd_exec(
             });
         }
 
-        let mut plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
-        let value = String::from_utf8(plaintext.clone()).map_err(|_| {
+        let plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
+        std::str::from_utf8(&plaintext).map_err(|_| {
             error::EnvsGateError::InvalidInput(format!(
                 "Value for '{}' contains invalid UTF-8",
                 var.key_name
             ))
         })?;
+        let value = String::from_utf8(plaintext).unwrap();
         env_pairs.push((var.key_name.clone(), value));
-        plaintext.zeroize();
     }
 
     if let Some(l) = log {
@@ -425,6 +425,7 @@ pub fn cmd_exec(
     // Forward SIGTERM/SIGINT to the child process
     let child_pid = child.id() as i32;
     unsafe {
+        CHILD_PID.store(child_pid, std::sync::atomic::Ordering::SeqCst);
         libc::signal(
             libc::SIGTERM,
             forward_signal_to_child as *const () as libc::sighandler_t,
@@ -433,14 +434,17 @@ pub fn cmd_exec(
             libc::SIGINT,
             forward_signal_to_child as *const () as libc::sighandler_t,
         );
-        CHILD_PID.store(child_pid, std::sync::atomic::Ordering::SeqCst);
     }
 
     let status = child.wait().map_err(|e| {
         error::EnvsGateError::InvalidInput(format!("Failed to wait for child process: {e}"))
     })?;
 
-    std::process::exit(status.code().unwrap_or(1));
+    use std::os::unix::process::ExitStatusExt;
+    let code = status
+        .code()
+        .unwrap_or_else(|| status.signal().map_or(1, |sig| 128 + sig));
+    std::process::exit(code);
 }
 
 #[cfg(test)]
