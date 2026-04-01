@@ -10,6 +10,10 @@ pub struct Cli {
     #[arg(long, default_value = "torii.db")]
     pub db_path: String,
 
+    /// Path to the audit log file
+    #[arg(long)]
+    pub log_path: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -50,5 +54,12 @@ pub enum Commands {
         /// Exit after the first read
         #[arg(long)]
         once: bool,
+    },
+
+    /// View audit logs
+    Logs {
+        /// Output format
+        #[arg(long, default_value = "tsv")]
+        format: String,
     },
 }
