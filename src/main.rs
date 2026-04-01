@@ -77,10 +77,11 @@ fn resolve_paths(
         // Explicit db-path: ignore namespace, place audit log next to DB
         let log = log_path.clone().unwrap_or_else(|| {
             let db_path = std::path::Path::new(db);
-            let dir = db_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."));
-            format!("{}/audit.log", dir.display())
+            let dir = db_path.parent().filter(|p| !p.as_os_str().is_empty());
+            match dir {
+                Some(d) => format!("{}/audit.log", d.display()),
+                None => "audit.log".into(),
+            }
         });
         return Ok((db.clone(), log));
     }
@@ -599,7 +600,10 @@ pub fn cmd_namespaces() -> error::Result<()> {
     let mut entries: Vec<String> = std::fs::read_dir(path)
         .map_err(|e| error::EnvsGateError::InvalidInput(format!("Cannot read directory: {e}")))?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir() && e.path().join("torii.db").exists())
+        .filter(|e| {
+            let p = e.path();
+            p.is_dir() && (p.join("torii.db").exists() || p.join("audit.log").exists())
+        })
         .filter_map(|e| e.file_name().into_string().ok())
         .collect();
     entries.sort();
@@ -1266,7 +1270,6 @@ mod tests {
     fn resolve_paths_explicit_db_path_ignores_namespace() {
         let (db, log) = resolve_paths(&Some("./custom.db".into()), "myproject", &None).unwrap();
         assert_eq!(db, "./custom.db");
-        // Log should be placed next to the DB
         assert_eq!(log, "./audit.log");
     }
 
@@ -1275,6 +1278,14 @@ mod tests {
         let (_, log) =
             resolve_paths(&Some("/tmp/mydir/vault.db".into()), "default", &None).unwrap();
         assert_eq!(log, "/tmp/mydir/audit.log");
+    }
+
+    #[test]
+    fn resolve_paths_bare_filename_db_path() {
+        // bare filename like "custom.db" — parent is empty, log should be "audit.log" in CWD
+        let (db, log) = resolve_paths(&Some("custom.db".into()), "default", &None).unwrap();
+        assert_eq!(db, "custom.db");
+        assert_eq!(log, "audit.log");
     }
 
     #[test]
@@ -1322,16 +1333,19 @@ mod tests {
         let home = dir.path().to_str().unwrap();
         unsafe { std::env::set_var("HOME", home) };
 
-        // Create namespace directories with DBs
+        // Create namespace directories
         let ns1 = format!("{home}/.torii/alpha");
         let ns2 = format!("{home}/.torii/beta");
+        let ns_log_only = format!("{home}/.torii/gamma");
         let ns_empty = format!("{home}/.torii/empty");
         std::fs::create_dir_all(&ns1).unwrap();
         std::fs::create_dir_all(&ns2).unwrap();
+        std::fs::create_dir_all(&ns_log_only).unwrap();
         std::fs::create_dir_all(&ns_empty).unwrap();
         std::fs::write(format!("{ns1}/torii.db"), b"").unwrap();
         std::fs::write(format!("{ns2}/torii.db"), b"").unwrap();
-        // ns_empty has no torii.db, should not appear
+        std::fs::write(format!("{ns_log_only}/audit.log"), b"").unwrap();
+        // ns_empty has neither torii.db nor audit.log, should not appear
 
         assert!(cmd_namespaces().is_ok());
     }
