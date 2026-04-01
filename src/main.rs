@@ -22,10 +22,7 @@ fn main() -> error::Result<()> {
 
     match cli.command {
         None => return tui::run_interactive(&cli.db_path),
-        Some(Commands::Set {
-            key_value,
-            expires,
-        }) => {
+        Some(Commands::Set { key_value, expires }) => {
             let mut password = prompt_password()?;
             let result = cmd_set(&cli.db_path, &password, &key_value, expires.as_deref());
             password.zeroize();
@@ -75,18 +72,17 @@ pub fn parse_expires(input: &str) -> error::Result<String> {
         .or_else(|| input.strip_suffix('m').map(|n| (n, 'm')))
         .or_else(|| input.strip_suffix('h').map(|n| (n, 'h')))
         .or_else(|| input.strip_suffix('d').map(|n| (n, 'd')))
+        && let Ok(num) = num_str.parse::<i64>()
     {
-        if let Ok(num) = num_str.parse::<i64>() {
-            let duration = match unit {
-                's' => chrono::Duration::seconds(num),
-                'm' => chrono::Duration::minutes(num),
-                'h' => chrono::Duration::hours(num),
-                'd' => chrono::Duration::days(num),
-                _ => unreachable!(),
-            };
-            let expires_at = Local::now().naive_local() + duration;
-            return Ok(expires_at.format("%Y-%m-%dT%H:%M:%S").to_string());
-        }
+        let duration = match unit {
+            's' => chrono::Duration::seconds(num),
+            'm' => chrono::Duration::minutes(num),
+            'h' => chrono::Duration::hours(num),
+            'd' => chrono::Duration::days(num),
+            _ => unreachable!(),
+        };
+        let expires_at = Local::now().naive_local() + duration;
+        return Ok(expires_at.format("%Y-%m-%dT%H:%M:%S").to_string());
     }
 
     // Try absolute datetime
@@ -118,7 +114,12 @@ fn is_expired(expires_at: &str) -> bool {
     false
 }
 
-pub fn cmd_set(db_path: &str, password: &str, key_value: &str, expires: Option<&str>) -> error::Result<()> {
+pub fn cmd_set(
+    db_path: &str,
+    password: &str,
+    key_value: &str,
+    expires: Option<&str>,
+) -> error::Result<()> {
     let (key, value) = key_value
         .split_once('=')
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Expected KEY=VALUE format".into()))?;
@@ -158,13 +159,13 @@ pub fn cmd_get(db_path: &str, password: &str, key: &str) -> error::Result<()> {
     let var = db::get_env_var(&conn, key)?
         .ok_or_else(|| error::EnvsGateError::KeyNotFound(key.into()))?;
 
-    if let Some(ref exp) = var.expires_at {
-        if is_expired(exp) {
-            return Err(error::EnvsGateError::KeyExpired {
-                key: key.into(),
-                expired_at: exp.clone(),
-            });
-        }
+    if let Some(ref exp) = var.expires_at
+        && is_expired(exp)
+    {
+        return Err(error::EnvsGateError::KeyExpired {
+            key: key.into(),
+            expired_at: exp.clone(),
+        });
     }
 
     let mut plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
@@ -231,13 +232,13 @@ pub fn cmd_serve(db_path: &str, password: &str, env_path: &str, once: bool) -> e
 
     let vars = db::list_env_vars(&conn)?;
     for var in &vars {
-        if let Some(ref exp) = var.expires_at {
-            if is_expired(exp) {
-                return Err(error::EnvsGateError::KeyExpired {
-                    key: var.key_name.clone(),
-                    expired_at: exp.clone(),
-                });
-            }
+        if let Some(ref exp) = var.expires_at
+            && is_expired(exp)
+        {
+            return Err(error::EnvsGateError::KeyExpired {
+                key: var.key_name.clone(),
+                expired_at: exp.clone(),
+            });
         }
     }
 

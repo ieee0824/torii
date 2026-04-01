@@ -1,11 +1,8 @@
-use aes_gcm::{
-    Aes256Gcm, KeyInit, Nonce,
-    aead::Aead,
-};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use argon2::Argon2;
 use hkdf::Hkdf;
+use ml_kem::kem::{Decapsulate, Encapsulate};
 use ml_kem::{Ciphertext, EncodedSizeUser, KemCore, MlKem768};
-use ml_kem::kem::{Encapsulate, Decapsulate};
 use rand::rngs::OsRng;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
@@ -144,9 +141,8 @@ pub fn unwrap_dek(password: &str, meta: &VaultMetadata) -> Result<[u8; DEK_LEN]>
     let ss_x25519 = x25519_static_secret.diffie_hellman(&x25519_eph_pub);
 
     // ML-KEM decapsulate
-    let ct_kem: Ciphertext<MlKem768> =
-        ml_kem::array::Array::try_from(meta.ct_kem.as_slice())
-            .map_err(|_| EnvsGateError::Crypto("Invalid ML-KEM ciphertext length".into()))?;
+    let ct_kem: Ciphertext<MlKem768> = ml_kem::array::Array::try_from(meta.ct_kem.as_slice())
+        .map_err(|_| EnvsGateError::Crypto("Invalid ML-KEM ciphertext length".into()))?;
     let ss_kem = dk_kem
         .decapsulate(&ct_kem)
         .map_err(|_| EnvsGateError::Crypto("ML-KEM decapsulate failed".into()))?;
