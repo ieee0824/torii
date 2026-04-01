@@ -1,257 +1,110 @@
-#![cfg(feature = "fuse")]
-
-use std::ffi::OsStr;
+use std::io::Write;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
-
-use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyOpen, Request,
-};
-use rusqlite::Connection;
 
 use crate::crypto;
 use crate::db;
 use crate::error::{EnvsGateError, Result};
 
-const TTL: Duration = Duration::from_secs(0);
-const ROOT_INO: u64 = 1;
-const FILE_INO: u64 = 2;
+fn generate_env_content(db_path: &str, dek: &[u8; 32]) -> Result<Vec<u8>> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let vars = db::list_env_vars(&conn)?;
+    let now = chrono::Local::now().naive_local();
+    let mut content = String::new();
 
-struct EnvFuseFs {
-    dek: [u8; 32],
-    db_path: String,
-    file_name: String,
-    content_cache: Arc<Mutex<Option<Vec<u8>>>>,
-}
-
-impl EnvFuseFs {
-    fn generate_content(&self) -> Vec<u8> {
-        let conn = match Connection::open(&self.db_path) {
-            Ok(c) => c,
-            Err(_) => return b"# error: could not open database\n".to_vec(),
-        };
-
-        let vars = match db::list_env_vars(&conn) {
-            Ok(v) => v,
-            Err(_) => return b"# error: could not read env vars\n".to_vec(),
-        };
-
-        let now = chrono::Local::now().date_naive();
-        let mut content = String::new();
-
-        for var in &vars {
-            // Skip expired vars
-            if let Some(ref exp) = var.expires_at {
-                if let Ok(exp_date) = chrono::NaiveDate::parse_from_str(exp, "%Y-%m-%d") {
-                    if now > exp_date {
-                        continue;
-                    }
-                }
-            }
-
-            match crypto::decrypt_value(&self.dek, &var.nonce, &var.ciphertext) {
-                Ok(plaintext) => {
-                    let value = String::from_utf8_lossy(&plaintext);
-                    content.push_str(&format!("{}={}\n", var.key_name, value));
-                }
-                Err(_) => {
-                    content.push_str(&format!("# error decrypting: {}\n", var.key_name));
-                }
+    for var in &vars {
+        if let Some(ref exp) = var.expires_at {
+            let expired = chrono::NaiveDateTime::parse_from_str(exp, "%Y-%m-%dT%H:%M:%S")
+                .map(|dt| now > dt)
+                .or_else(|_| {
+                    chrono::NaiveDate::parse_from_str(exp, "%Y-%m-%d").map(|d| now.date() > d)
+                })
+                .unwrap_or(false);
+            if expired {
+                eprintln!("Warning: {} expired at {}", var.key_name, exp);
+                continue;
             }
         }
 
-        content.into_bytes()
+        let plaintext = crypto::decrypt_value(dek, &var.nonce, &var.ciphertext)?;
+        let value = String::from_utf8_lossy(&plaintext);
+        content.push_str(&format!("{}={}\n", var.key_name, value));
     }
 
-    fn file_attr(&self, size: u64) -> FileAttr {
-        FileAttr {
-            ino: FILE_INO,
-            size,
-            blocks: 1,
-            atime: SystemTime::now(),
-            mtime: SystemTime::now(),
-            ctime: SystemTime::now(),
-            crtime: SystemTime::now(),
-            kind: FileType::RegularFile,
-            perm: 0o444,
-            nlink: 1,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: 0,
-            blksize: 512,
-            flags: 0,
-        }
-    }
-
-    fn dir_attr() -> FileAttr {
-        FileAttr {
-            ino: ROOT_INO,
-            size: 0,
-            blocks: 0,
-            atime: SystemTime::now(),
-            mtime: SystemTime::now(),
-            ctime: SystemTime::now(),
-            crtime: SystemTime::now(),
-            kind: FileType::Directory,
-            perm: 0o555,
-            nlink: 2,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: 0,
-            blksize: 512,
-            flags: 0,
-        }
-    }
-}
-
-impl Filesystem for EnvFuseFs {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        if parent == ROOT_INO && name.to_str() == Some(&self.file_name) {
-            let content = self.generate_content();
-            let attr = self.file_attr(content.len() as u64);
-            *self.content_cache.lock().unwrap() = Some(content);
-            reply.entry(&TTL, &attr, 0);
-        } else {
-            reply.error(libc::ENOENT);
-        }
-    }
-
-    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        match ino {
-            ROOT_INO => reply.attr(&TTL, &Self::dir_attr()),
-            FILE_INO => {
-                let content = self.generate_content();
-                let attr = self.file_attr(content.len() as u64);
-                *self.content_cache.lock().unwrap() = Some(content);
-                reply.attr(&TTL, &attr);
-            }
-            _ => reply.error(libc::ENOENT),
-        }
-    }
-
-    fn readdir(
-        &mut self,
-        _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        mut reply: ReplyDirectory,
-    ) {
-        if ino != ROOT_INO {
-            reply.error(libc::ENOENT);
-            return;
-        }
-
-        let entries = vec![
-            (ROOT_INO, FileType::Directory, "."),
-            (ROOT_INO, FileType::Directory, ".."),
-            (FILE_INO, FileType::RegularFile, &self.file_name),
-        ];
-
-        for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-            if reply.add(ino, (i + 1) as i64, kind, name) {
-                break;
-            }
-        }
-
-        reply.ok();
-    }
-
-    fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-        if ino == FILE_INO {
-            reply.opened(0, fuser::consts::FOPEN_DIRECT_IO);
-        } else {
-            reply.error(libc::ENOENT);
-        }
-    }
-
-    fn read(
-        &mut self,
-        _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        reply: ReplyData,
-    ) {
-        if ino != FILE_INO {
-            reply.error(libc::ENOENT);
-            return;
-        }
-
-        let content = self.generate_content();
-        let offset = offset as usize;
-
-        if offset >= content.len() {
-            reply.data(&[]);
-        } else {
-            let end = (offset + size as usize).min(content.len());
-            reply.data(&content[offset..end]);
-        }
-    }
+    Ok(content.into_bytes())
 }
 
 pub fn serve(db_path: &str, dek: &[u8; 32], env_path: &str) -> Result<()> {
     let path = Path::new(env_path);
-    let file_name = path
-        .file_name()
-        .unwrap_or(OsStr::new(".env"))
-        .to_string_lossy()
-        .to_string();
 
-    let mount_dir = path.parent().unwrap_or(Path::new("."));
-
-    let mount_dir = if mount_dir.is_relative() {
+    // Resolve to absolute path
+    let path = if path.is_relative() {
         std::env::current_dir()
             .map_err(|e| EnvsGateError::Fuse(format!("Cannot get cwd: {e}")))?
-            .join(mount_dir)
+            .join(path)
     } else {
-        mount_dir.to_path_buf()
+        path.to_path_buf()
     };
 
-    let mount_point = mount_dir.join(format!(".envs-gate-mount-{}", std::process::id()));
-    std::fs::create_dir_all(&mount_point)
-        .map_err(|e| EnvsGateError::Fuse(format!("Cannot create mount point: {e}")))?;
+    // Remove existing file/pipe at the path
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .map_err(|e| EnvsGateError::Fuse(format!("Cannot remove existing file: {e}")))?;
+    }
 
-    let fs = EnvFuseFs {
-        dek: *dek,
-        db_path: db_path.to_string(),
-        file_name,
-        content_cache: Arc::new(Mutex::new(None)),
-    };
+    // Create named pipe (FIFO)
+    let path_cstr = std::ffi::CString::new(path.to_str().unwrap())
+        .map_err(|e| EnvsGateError::Fuse(format!("Invalid path: {e}")))?;
 
-    eprintln!("Mounting virtual .env at: {}", mount_point.display());
-    eprintln!(
-        "Access your env file at: {}",
-        mount_point.join(&fs.file_name).display()
-    );
-    eprintln!("Press Ctrl+C to unmount and exit");
+    let ret = unsafe { libc::mkfifo(path_cstr.as_ptr(), 0o644) };
+    if ret != 0 {
+        return Err(EnvsGateError::Fuse(format!(
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
 
-    let mount_point_clone = mount_point.clone();
+    eprintln!("Serving virtual .env at: {}", path.display());
+    eprintln!("Press Ctrl+C to stop");
+
+    // Cleanup FIFO on Ctrl+C
+    let path_clone = path.clone();
     ctrlc::set_handler(move || {
-        eprintln!("\nUnmounting...");
-        let _ = std::process::Command::new("umount")
-            .arg(&mount_point_clone)
-            .status();
+        let _ = std::fs::remove_file(&path_clone);
+        eprintln!("\nStopped.");
         std::process::exit(0);
     })
     .map_err(|e| EnvsGateError::Fuse(format!("Cannot set Ctrl+C handler: {e}")))?;
 
-    let options = vec![
-        MountOption::RO,
-        MountOption::FSName("envs-gate".to_string()),
-        MountOption::AutoUnmount,
-        MountOption::AllowOther,
-    ];
+    let db_path = db_path.to_string();
+    let dek = *dek;
 
-    fuser::mount2(fs, &mount_point, &options)
-        .map_err(|e| EnvsGateError::Fuse(format!("FUSE mount failed: {e}")))?;
+    // Loop: each iteration serves one reader
+    loop {
+        // open for writing blocks until a reader opens the pipe
+        let file = std::fs::OpenOptions::new().write(true).open(&path);
 
-    let _ = std::fs::remove_dir(&mount_point);
+        match file {
+            Ok(mut f) => {
+                match generate_env_content(&db_path, &dek) {
+                    Ok(content) => {
+                        let _ = f.write_all(&content);
+                    }
+                    Err(e) => {
+                        let msg = format!("# error: {e}\n");
+                        let _ = f.write_all(msg.as_bytes());
+                    }
+                }
+                // f is dropped here, closing the write end → reader gets EOF
+            }
+            Err(e) => {
+                // FIFO was removed or other error
+                if !path.exists() {
+                    break;
+                }
+                eprintln!("Warning: pipe open failed: {e}");
+            }
+        }
+    }
 
     Ok(())
 }

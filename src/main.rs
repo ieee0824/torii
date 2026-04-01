@@ -2,9 +2,10 @@ mod cli;
 mod crypto;
 mod db;
 mod error;
-#[cfg(feature = "fuse")]
 mod fuse_fs;
+mod tui;
 
+use chrono::Local;
 use clap::Parser;
 use cli::{Cli, Commands};
 
@@ -12,29 +13,87 @@ fn main() -> error::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Set {
+        None => return tui::run_interactive(&cli.db_path),
+        Some(Commands::Set {
             password,
             key_value,
             expires,
-        } => cmd_set(&cli.db_path, &password, &key_value, expires.as_deref())?,
-        Commands::Get { password, key } => cmd_get(&cli.db_path, &password, &key)?,
-        Commands::List { password } => cmd_list(&cli.db_path, &password)?,
-        Commands::Delete { password, key } => cmd_delete(&cli.db_path, &password, &key)?,
-        Commands::Serve { password, env_path } => cmd_serve(&cli.db_path, &password, &env_path)?,
+        }) => cmd_set(&cli.db_path, &password, &key_value, expires.as_deref())?,
+        Some(Commands::Get { password, key }) => cmd_get(&cli.db_path, &password, &key)?,
+        Some(Commands::List { password }) => cmd_list(&cli.db_path, &password)?,
+        Some(Commands::Delete { password, key }) => cmd_delete(&cli.db_path, &password, &key)?,
+        Some(Commands::Serve { password, env_path }) => cmd_serve(&cli.db_path, &password, &env_path)?,
     }
 
     Ok(())
 }
 
-fn cmd_set(db_path: &str, password: &str, key_value: &str, expires: Option<&str>) -> error::Result<()> {
+/// Parse an expiry string into an ISO 8601 datetime string.
+/// Accepts:
+///   - Relative: "30s", "5m", "1h", "7d" (seconds, minutes, hours, days)
+///   - Absolute date: "2025-12-31"
+///   - Absolute datetime: "2025-12-31T23:59:59"
+pub fn parse_expires(input: &str) -> error::Result<String> {
+    let input = input.trim();
+
+    // Try relative duration: <number><unit>
+    if let Some((num_str, unit)) = input
+        .strip_suffix('s')
+        .map(|n| (n, 's'))
+        .or_else(|| input.strip_suffix('m').map(|n| (n, 'm')))
+        .or_else(|| input.strip_suffix('h').map(|n| (n, 'h')))
+        .or_else(|| input.strip_suffix('d').map(|n| (n, 'd')))
+    {
+        if let Ok(num) = num_str.parse::<i64>() {
+            let duration = match unit {
+                's' => chrono::Duration::seconds(num),
+                'm' => chrono::Duration::minutes(num),
+                'h' => chrono::Duration::hours(num),
+                'd' => chrono::Duration::days(num),
+                _ => unreachable!(),
+            };
+            let expires_at = Local::now().naive_local() + duration;
+            return Ok(expires_at.format("%Y-%m-%dT%H:%M:%S").to_string());
+        }
+    }
+
+    // Try absolute datetime
+    if chrono::NaiveDateTime::parse_from_str(input, "%Y-%m-%dT%H:%M:%S").is_ok() {
+        return Ok(input.to_string());
+    }
+
+    // Try absolute date (set to end of day)
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(input, "%Y-%m-%d") {
+        let dt = date.and_hms_opt(23, 59, 59).unwrap();
+        return Ok(dt.format("%Y-%m-%dT%H:%M:%S").to_string());
+    }
+
+    Err(error::EnvsGateError::InvalidInput(format!(
+        "Invalid expires format: '{input}'. Use: 30s, 5m, 1h, 7d, YYYY-MM-DD, or YYYY-MM-DDTHH:MM:SS"
+    )))
+}
+
+fn is_expired(expires_at: &str) -> bool {
+    let now = Local::now().naive_local();
+    // Try datetime first, then date
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%dT%H:%M:%S") {
+        return now > dt;
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(expires_at, "%Y-%m-%d") {
+        return now.date() > d;
+    }
+    false
+}
+
+pub fn cmd_set(db_path: &str, password: &str, key_value: &str, expires: Option<&str>) -> error::Result<()> {
     let (key, value) = key_value
         .split_once('=')
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Expected KEY=VALUE format".into()))?;
 
-    if let Some(exp) = expires {
-        chrono::NaiveDate::parse_from_str(exp, "%Y-%m-%d")
-            .map_err(|e| error::EnvsGateError::InvalidInput(format!("Invalid date: {e}")))?;
-    }
+    let resolved_expires = match expires {
+        Some(exp) => Some(parse_expires(exp)?),
+        None => None,
+    };
 
     let conn = db::open_or_create_db(db_path)?;
 
@@ -47,13 +106,17 @@ fn cmd_set(db_path: &str, password: &str, key_value: &str, expires: Option<&str>
     };
 
     let (nonce, ciphertext) = crypto::encrypt_value(&dek, value.as_bytes())?;
-    db::upsert_env_var(&conn, key, &nonce, &ciphertext, expires)?;
+    db::upsert_env_var(&conn, key, &nonce, &ciphertext, resolved_expires.as_deref())?;
 
-    eprintln!("Set: {key}");
+    if let Some(ref exp) = resolved_expires {
+        eprintln!("Set: {key} (expires: {exp})");
+    } else {
+        eprintln!("Set: {key}");
+    }
     Ok(())
 }
 
-fn cmd_get(db_path: &str, password: &str, key: &str) -> error::Result<()> {
+pub fn cmd_get(db_path: &str, password: &str, key: &str) -> error::Result<()> {
     let conn = db::open_or_create_db(db_path)?;
     let meta = db::load_metadata(&conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
@@ -63,9 +126,7 @@ fn cmd_get(db_path: &str, password: &str, key: &str) -> error::Result<()> {
         .ok_or_else(|| error::EnvsGateError::KeyNotFound(key.into()))?;
 
     if let Some(ref exp) = var.expires_at {
-        let exp_date = chrono::NaiveDate::parse_from_str(exp, "%Y-%m-%d")
-            .map_err(|e| error::EnvsGateError::InvalidInput(format!("Invalid stored date: {e}")))?;
-        if chrono::Local::now().date_naive() > exp_date {
+        if is_expired(exp) {
             return Err(error::EnvsGateError::KeyExpired {
                 key: key.into(),
                 expired_at: exp.clone(),
@@ -78,21 +139,16 @@ fn cmd_get(db_path: &str, password: &str, key: &str) -> error::Result<()> {
     Ok(())
 }
 
-fn cmd_list(db_path: &str, password: &str) -> error::Result<()> {
+pub fn cmd_list(db_path: &str, password: &str) -> error::Result<()> {
     let conn = db::open_or_create_db(db_path)?;
     let meta = db::load_metadata(&conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
     let dek = crypto::unwrap_dek(password, &meta)?;
 
     let vars = db::list_env_vars(&conn)?;
-    let now = chrono::Local::now().date_naive();
 
     for var in &vars {
-        let expired = var.expires_at.as_ref().is_some_and(|exp| {
-            chrono::NaiveDate::parse_from_str(exp, "%Y-%m-%d")
-                .map(|d| now > d)
-                .unwrap_or(false)
-        });
+        let expired = var.expires_at.as_ref().is_some_and(|exp| is_expired(exp));
 
         let plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
         let value = String::from_utf8_lossy(&plaintext);
@@ -114,7 +170,7 @@ fn cmd_list(db_path: &str, password: &str) -> error::Result<()> {
     Ok(())
 }
 
-fn cmd_delete(db_path: &str, password: &str, key: &str) -> error::Result<()> {
+pub fn cmd_delete(db_path: &str, password: &str, key: &str) -> error::Result<()> {
     let conn = db::open_or_create_db(db_path)?;
     let meta = db::load_metadata(&conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
@@ -129,38 +185,23 @@ fn cmd_delete(db_path: &str, password: &str, key: &str) -> error::Result<()> {
     Ok(())
 }
 
-fn cmd_serve(db_path: &str, password: &str, env_path: &str) -> error::Result<()> {
-    #[cfg(not(feature = "fuse"))]
-    {
-        let _ = (db_path, password, env_path);
-        return Err(error::EnvsGateError::Fuse(
-            "FUSE support not compiled. Rebuild with: cargo build --features fuse".into(),
-        ));
-    }
+pub fn cmd_serve(db_path: &str, password: &str, env_path: &str) -> error::Result<()> {
+    let conn = db::open_or_create_db(db_path)?;
+    let meta = db::load_metadata(&conn)?
+        .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
+    let dek = crypto::unwrap_dek(password, &meta)?;
 
-    #[cfg(feature = "fuse")]
-    {
-        let conn = db::open_or_create_db(db_path)?;
-        let meta = db::load_metadata(&conn)?
-            .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
-        let dek = crypto::unwrap_dek(password, &meta)?;
-
-        // Check for expired vars at startup
-        let vars = db::list_env_vars(&conn)?;
-        let now = chrono::Local::now().date_naive();
-        for var in &vars {
-            if let Some(ref exp) = var.expires_at {
-                if let Ok(exp_date) = chrono::NaiveDate::parse_from_str(exp, "%Y-%m-%d") {
-                    if now > exp_date {
-                        return Err(error::EnvsGateError::KeyExpired {
-                            key: var.key_name.clone(),
-                            expired_at: exp.clone(),
-                        });
-                    }
-                }
+    let vars = db::list_env_vars(&conn)?;
+    for var in &vars {
+        if let Some(ref exp) = var.expires_at {
+            if is_expired(exp) {
+                return Err(error::EnvsGateError::KeyExpired {
+                    key: var.key_name.clone(),
+                    expired_at: exp.clone(),
+                });
             }
         }
-
-        fuse_fs::serve(db_path, &dek, env_path)
     }
+
+    fuse_fs::serve(db_path, &dek, env_path)
 }

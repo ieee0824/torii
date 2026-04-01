@@ -8,7 +8,7 @@ pub struct Cli {
     pub db_path: String,
 
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -50,7 +50,7 @@ pub enum Commands {
         key: String,
     },
 
-    /// Serve a virtual .env file via FUSE
+    /// Serve a virtual .env file via named pipe
     Serve {
         #[arg(short, long)]
         password: String,
