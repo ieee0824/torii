@@ -55,9 +55,16 @@ fn validate_namespace(ns: &str) -> error::Result<()> {
     Ok(())
 }
 
+fn home_dir() -> error::Result<String> {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| {
+            error::EnvsGateError::InvalidInput("HOME (or USERPROFILE on Windows) not set".into())
+        })
+}
+
 fn torii_home() -> error::Result<String> {
-    let home = std::env::var("HOME")
-        .map_err(|_| error::EnvsGateError::InvalidInput("HOME not set".into()))?;
+    let home = home_dir()?;
     Ok(format!("{home}/.torii"))
 }
 
@@ -67,8 +74,14 @@ fn resolve_paths(
     log_path: &Option<String>,
 ) -> error::Result<(String, String)> {
     if let Some(db) = db_path {
-        // Explicit db-path: ignore namespace
-        let log = log_path.clone().unwrap_or_else(logger::default_log_path);
+        // Explicit db-path: ignore namespace, place audit log next to DB
+        let log = log_path.clone().unwrap_or_else(|| {
+            let db_path = std::path::Path::new(db);
+            let dir = db_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            format!("{}/audit.log", dir.display())
+        });
         return Ok((db.clone(), log));
     }
 
@@ -84,8 +97,12 @@ fn resolve_paths(
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o700);
-        let _ = std::fs::set_permissions(&torii_home, perms.clone());
-        let _ = std::fs::set_permissions(&ns_dir, perms);
+        if let Err(e) = std::fs::set_permissions(&torii_home, perms.clone()) {
+            eprintln!("Warning: Failed to set permissions on '{torii_home}': {e}");
+        }
+        if let Err(e) = std::fs::set_permissions(&ns_dir, perms) {
+            eprintln!("Warning: Failed to set permissions on '{ns_dir}': {e}");
+        }
     }
 
     let db = format!("{ns_dir}/torii.db");
@@ -1247,8 +1264,17 @@ mod tests {
 
     #[test]
     fn resolve_paths_explicit_db_path_ignores_namespace() {
-        let (db, _log) = resolve_paths(&Some("./custom.db".into()), "myproject", &None).unwrap();
+        let (db, log) = resolve_paths(&Some("./custom.db".into()), "myproject", &None).unwrap();
         assert_eq!(db, "./custom.db");
+        // Log should be placed next to the DB
+        assert_eq!(log, "./audit.log");
+    }
+
+    #[test]
+    fn resolve_paths_explicit_db_path_log_adjacent() {
+        let (_, log) =
+            resolve_paths(&Some("/tmp/mydir/vault.db".into()), "default", &None).unwrap();
+        assert_eq!(log, "/tmp/mydir/audit.log");
     }
 
     #[test]

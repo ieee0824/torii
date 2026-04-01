@@ -9,7 +9,8 @@ use crate::error::{EnvsGateError, Result};
 
 const MAX_LOG_SIZE: u64 = 10 * 1024 * 1024; // 10MB
 
-/// Default log path
+/// Default log path (used as fallback)
+#[cfg(test)]
 pub fn default_log_path() -> String {
     if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
