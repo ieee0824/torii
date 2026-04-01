@@ -79,7 +79,9 @@ pub fn init_vault(password: &str) -> Result<(VaultMetadata, [u8; DEK_LEN])> {
     let ss_x25519 = x25519_eph_secret.diffie_hellman(&x25519_static_pub);
 
     // 2. ML-KEM encapsulate
-    let (ct_kem, ss_kem) = ek_kem.encapsulate(&mut OsRng).unwrap();
+    let (ct_kem, ss_kem) = ek_kem
+        .encapsulate(&mut OsRng)
+        .map_err(|e| EnvsGateError::Crypto(format!("ML-KEM encapsulate: {e:?}")))?;
 
     // 3. Combine shared secrets with HKDF
     let mut ikm = Vec::with_capacity(64);

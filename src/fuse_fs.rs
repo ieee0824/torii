@@ -45,21 +45,21 @@ pub fn serve(db_path: &str, dek: &[u8; 32], env_path: &str, once: bool) -> Resul
         path.to_path_buf()
     };
 
-    // Remove existing file/pipe at the path
-    if path.exists() {
-        std::fs::remove_file(&path)
-            .map_err(|e| EnvsGateError::Fuse(format!("Cannot remove existing file: {e}")))?;
-    }
-
-    // Create named pipe (FIFO)
+    // Create named pipe (FIFO) - remove existing first, then create atomically
     let path_cstr = std::ffi::CString::new(path.to_str().unwrap())
         .map_err(|e| EnvsGateError::Fuse(format!("Invalid path: {e}")))?;
 
-    let ret = unsafe { libc::mkfifo(path_cstr.as_ptr(), 0o644) };
+    let _ = std::fs::remove_file(&path);
+    let ret = unsafe { libc::mkfifo(path_cstr.as_ptr(), 0o600) };
     if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EEXIST) {
+            return Err(EnvsGateError::Fuse(format!(
+                "File already exists at {}", path.display()
+            )));
+        }
         return Err(EnvsGateError::Fuse(format!(
-            "mkfifo failed: {}",
-            std::io::Error::last_os_error()
+            "mkfifo failed at {}: {}", path.display(), err
         )));
     }
 

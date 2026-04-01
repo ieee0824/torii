@@ -23,6 +23,8 @@ cargo install --path .
 
 ## 使い方
 
+パスワードは全コマンドで対話的にプロンプト入力される（プロセスリストに露出しない）。
+
 ### 対話モード
 
 引数なしで起動すると対話モードに入る。
@@ -46,43 +48,43 @@ Password: ********
 #### 環境変数の設定
 
 ```
-torii set -p <password> <NAME>=<VALUE>
+torii set <NAME>=<VALUE>
 ```
 
 有効期限付き:
 
 ```
-torii set -p <password> <NAME>=<VALUE> --expires 1h
+torii set <NAME>=<VALUE> --expires 1h
 ```
 
 #### 環境変数の取得
 
 ```
-torii get -p <password> <NAME>
+torii get <NAME>
 ```
 
 #### 一覧表示
 
 ```
-torii list -p <password>
+torii list
 ```
 
 #### 削除
 
 ```
-torii delete -p <password> <NAME>
+torii delete <NAME>
 ```
 
 #### 仮想.envファイルの提供
 
 ```
-torii serve -p <password> -e .env
+torii serve -e .env
 ```
 
 1回読まれたら自動終了:
 
 ```
-torii serve -p <password> -e .env --once
+torii serve -e .env --once
 ```
 
 Named pipe（FIFO）として指定パスに仮想`.env`ファイルを作成する。
@@ -99,10 +101,16 @@ Named pipe（FIFO）として指定パスに仮想`.env`ファイルを作成す
 | フラグ | 説明 | デフォルト |
 |---|---|---|
 | `--db-path <path>` | SQLiteデータベースのパス | `torii.db` |
-| `-p, --password <pw>` | 暗号化パスワード | （必須） |
 | `--expires <duration>` | 有効期限（`set`時） | なし |
 | `-e, --env-path <path>` | 仮想.envのパス（`serve`時） | `.env` |
 | `--once` | 1回読まれたら終了（`serve`時） | off |
+
+## セキュリティ
+
+- パスワードはプロンプト入力のみ（`ps`コマンドで見えない）
+- パスワード・平文はメモリ上で使用後にzeroize
+- DBファイルはオーナーのみ読み書き可（0600）
+- Named pipeもオーナーのみ読み書き可（0600）
 
 ## 有効期限
 

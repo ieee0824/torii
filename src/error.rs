@@ -8,7 +8,7 @@ pub enum EnvsGateError {
     #[error("Database error: {0}")]
     Db(#[from] rusqlite::Error),
 
-    #[error("Authentication failed: wrong password")]
+    #[error("Authentication failed")]
     AuthenticationFailed,
 
     #[error("Key not found: {0}")]

@@ -8,6 +8,14 @@ mod tui;
 use chrono::Local;
 use clap::Parser;
 use cli::{Cli, Commands};
+use zeroize::Zeroize;
+
+fn prompt_password() -> error::Result<String> {
+    dialoguer::Password::new()
+        .with_prompt("Password")
+        .interact()
+        .map_err(|e| error::EnvsGateError::InvalidInput(format!("Password prompt failed: {e}")))
+}
 
 fn main() -> error::Result<()> {
     let cli = Cli::parse();
@@ -15,14 +23,38 @@ fn main() -> error::Result<()> {
     match cli.command {
         None => return tui::run_interactive(&cli.db_path),
         Some(Commands::Set {
-            password,
             key_value,
             expires,
-        }) => cmd_set(&cli.db_path, &password, &key_value, expires.as_deref())?,
-        Some(Commands::Get { password, key }) => cmd_get(&cli.db_path, &password, &key)?,
-        Some(Commands::List { password }) => cmd_list(&cli.db_path, &password)?,
-        Some(Commands::Delete { password, key }) => cmd_delete(&cli.db_path, &password, &key)?,
-        Some(Commands::Serve { password, env_path, once }) => cmd_serve(&cli.db_path, &password, &env_path, once)?,
+        }) => {
+            let mut password = prompt_password()?;
+            let result = cmd_set(&cli.db_path, &password, &key_value, expires.as_deref());
+            password.zeroize();
+            result?;
+        }
+        Some(Commands::Get { key }) => {
+            let mut password = prompt_password()?;
+            let result = cmd_get(&cli.db_path, &password, &key);
+            password.zeroize();
+            result?;
+        }
+        Some(Commands::List) => {
+            let mut password = prompt_password()?;
+            let result = cmd_list(&cli.db_path, &password);
+            password.zeroize();
+            result?;
+        }
+        Some(Commands::Delete { key }) => {
+            let mut password = prompt_password()?;
+            let result = cmd_delete(&cli.db_path, &password, &key);
+            password.zeroize();
+            result?;
+        }
+        Some(Commands::Serve { env_path, once }) => {
+            let mut password = prompt_password()?;
+            let result = cmd_serve(&cli.db_path, &password, &env_path, once);
+            password.zeroize();
+            result?;
+        }
     }
 
     Ok(())
@@ -64,7 +96,9 @@ pub fn parse_expires(input: &str) -> error::Result<String> {
 
     // Try absolute date (set to end of day)
     if let Ok(date) = chrono::NaiveDate::parse_from_str(input, "%Y-%m-%d") {
-        let dt = date.and_hms_opt(23, 59, 59).unwrap();
+        let dt = date
+            .and_hms_opt(23, 59, 59)
+            .ok_or_else(|| error::EnvsGateError::InvalidInput("Invalid time".into()))?;
         return Ok(dt.format("%Y-%m-%dT%H:%M:%S").to_string());
     }
 
@@ -75,7 +109,6 @@ pub fn parse_expires(input: &str) -> error::Result<String> {
 
 fn is_expired(expires_at: &str) -> bool {
     let now = Local::now().naive_local();
-    // Try datetime first, then date
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%dT%H:%M:%S") {
         return now > dt;
     }
@@ -134,8 +167,9 @@ pub fn cmd_get(db_path: &str, password: &str, key: &str) -> error::Result<()> {
         }
     }
 
-    let plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
+    let mut plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
     println!("{}", String::from_utf8_lossy(&plaintext));
+    plaintext.zeroize();
     Ok(())
 }
 
@@ -150,7 +184,7 @@ pub fn cmd_list(db_path: &str, password: &str) -> error::Result<()> {
     for var in &vars {
         let expired = var.expires_at.as_ref().is_some_and(|exp| is_expired(exp));
 
-        let plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
+        let mut plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
         let value = String::from_utf8_lossy(&plaintext);
 
         if expired {
@@ -165,6 +199,9 @@ pub fn cmd_list(db_path: &str, password: &str) -> error::Result<()> {
         } else {
             println!("{}={}", var.key_name, value);
         }
+
+        drop(value);
+        plaintext.zeroize();
     }
 
     Ok(())
@@ -174,6 +211,7 @@ pub fn cmd_delete(db_path: &str, password: &str, key: &str) -> error::Result<()>
     let conn = db::open_or_create_db(db_path)?;
     let meta = db::load_metadata(&conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
+    // Verify password
     let _dek = crypto::unwrap_dek(password, &meta)?;
 
     if db::delete_env_var(&conn, key)? {

@@ -21,6 +21,14 @@ pub struct EncryptedEnvVar {
 
 pub fn open_or_create_db(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
+
+    // Restrict DB file to owner-only access
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = std::fs::set_permissions(path, perms);
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS metadata (
             id          INTEGER PRIMARY KEY CHECK (id = 1),
