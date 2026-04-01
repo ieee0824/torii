@@ -86,7 +86,7 @@ pub fn init_vault(password: &str) -> Result<(VaultMetadata, [u8; DEK_LEN])> {
     ikm.extend_from_slice(ss_kem.as_ref());
     ikm.extend_from_slice(ss_x25519.as_bytes());
 
-    let hk = Hkdf::<Sha256>::new(Some(b"envs-gate-hybrid-wrap"), &ikm);
+    let hk = Hkdf::<Sha256>::new(Some(b"torii-hybrid-wrap"), &ikm);
     let mut wrapping_key = [0u8; 32];
     hk.expand(b"dek-wrapping", &mut wrapping_key)
         .map_err(|e| EnvsGateError::Crypto(format!("HKDF expand: {e}")))?;
@@ -154,7 +154,7 @@ pub fn unwrap_dek(password: &str, meta: &VaultMetadata) -> Result<[u8; DEK_LEN]>
     ikm.extend_from_slice(ss_kem.as_ref());
     ikm.extend_from_slice(ss_x25519.as_bytes());
 
-    let hk = Hkdf::<Sha256>::new(Some(b"envs-gate-hybrid-wrap"), &ikm);
+    let hk = Hkdf::<Sha256>::new(Some(b"torii-hybrid-wrap"), &ikm);
     let mut wrapping_key = [0u8; 32];
     hk.expand(b"dek-wrapping", &mut wrapping_key)
         .map_err(|e| EnvsGateError::Crypto(format!("HKDF expand: {e}")))?;

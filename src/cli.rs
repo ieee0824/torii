@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "envs-gate", about = "Protect environment variables with hybrid PQC encryption")]
+#[command(name = "torii", about = "Protect environment variables with hybrid PQC encryption")]
 pub struct Cli {
     /// Path to the SQLite database file
-    #[arg(long, default_value = "envs-gate.db")]
+    #[arg(long, default_value = "torii.db")]
     pub db_path: String,
 
     #[command(subcommand)]

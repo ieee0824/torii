@@ -396,29 +396,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
 
 [[package]]
-name = "envs-gate"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "argon2",
- "chrono",
- "clap",
- "ctrlc",
- "dialoguer",
- "hkdf",
- "libc",
- "ml-kem",
- "rand",
- "rand_chacha",
- "rand_core",
- "rusqlite",
- "sha2",
- "thiserror 2.0.18",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1085,6 +1062,29 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "torii"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "argon2",
+ "chrono",
+ "clap",
+ "ctrlc",
+ "dialoguer",
+ "hkdf",
+ "libc",
+ "ml-kem",
+ "rand",
+ "rand_chacha",
+ "rand_core",
+ "rusqlite",
+ "sha2",
+ "thiserror 2.0.18",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

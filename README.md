@@ -1,4 +1,4 @@
-# envs-gate
+# torii
 
 環境変数をハイブリッドポスト量子暗号（PQC）で保護するCLIツール。
 
@@ -28,7 +28,7 @@ cargo install --path .
 引数なしで起動すると対話モードに入る。
 
 ```
-$ envs-gate
+$ torii
 Password: ********
 ? What do you want to do?
 > Set environment variable
@@ -46,37 +46,37 @@ Password: ********
 #### 環境変数の設定
 
 ```
-envs-gate set -p <password> <NAME>=<VALUE>
+torii set -p <password> <NAME>=<VALUE>
 ```
 
 有効期限付き:
 
 ```
-envs-gate set -p <password> <NAME>=<VALUE> --expires 1h
+torii set -p <password> <NAME>=<VALUE> --expires 1h
 ```
 
 #### 環境変数の取得
 
 ```
-envs-gate get -p <password> <NAME>
+torii get -p <password> <NAME>
 ```
 
 #### 一覧表示
 
 ```
-envs-gate list -p <password>
+torii list -p <password>
 ```
 
 #### 削除
 
 ```
-envs-gate delete -p <password> <NAME>
+torii delete -p <password> <NAME>
 ```
 
 #### 仮想.envファイルの提供
 
 ```
-envs-gate serve -p <password> -e .env
+torii serve -p <password> -e .env
 ```
 
 Named pipe（FIFO）として指定パスに仮想`.env`ファイルを作成する。
@@ -92,7 +92,7 @@ Named pipe（FIFO）として指定パスに仮想`.env`ファイルを作成す
 
 | フラグ | 説明 | デフォルト |
 |---|---|---|
-| `--db-path <path>` | SQLiteデータベースのパス | `envs-gate.db` |
+| `--db-path <path>` | SQLiteデータベースのパス | `torii.db` |
 | `-p, --password <pw>` | 暗号化パスワード | （必須） |
 | `--expires <duration>` | 有効期限（`set`時） | なし |
 | `-e, --env-path <path>` | 仮想.envのパス（`serve`時） | `.env` |
