@@ -217,11 +217,40 @@ Named pipe（FIFO）として指定パスに仮想`.env`ファイルを作成す
 - 読み取りのたびに動的に復号（キャッシュなし）
 - serve中に期限切れを検出した場合はstderrに警告を出力
 
+## Namespace
+
+プロジェクトごとにデータベースと監査ログを分離できる。
+
+```
+~/.torii/
+  default/        # デフォルト namespace
+    torii.db
+    audit.log
+  myproject/      # カスタム namespace
+    torii.db
+    audit.log
+```
+
+### 使い方
+
+```
+torii -n myproject set API_KEY=xxx    # myproject namespace に保存
+torii -n myproject get API_KEY        # myproject namespace から取得
+torii namespaces                      # namespace 一覧表示
+```
+
+- `--db-path` 未指定時、データベースは `~/.torii/<namespace>/torii.db` に保存される
+- namespace ごとにパスワードは独立（別々のDEK）
+- namespace 間のデータは完全に分離されている
+- `--db-path` を明示指定した場合、namespace は無視される
+- namespace 名は英数字、ハイフン、アンダースコアのみ使用可能
+
 ## オプション
 
 | フラグ | 説明 | デフォルト |
 |---|---|---|
-| `--db-path <path>` | SQLiteデータベースのパス | `torii.db` |
+| `--db-path <path>` | SQLiteデータベースのパス（namespace を上書き） | `~/.torii/default/torii.db` |
+| `-n, --namespace <name>` | namespace 名 | `default` |
 | `--expires <duration>` | 有効期限（`set`時） | なし |
 | `-e, --env-path <path>` | 仮想.envのパス（`serve`時） | `.env` |
 | `--once` | 1回読まれたら終了（`serve`時） | off |

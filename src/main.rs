@@ -33,10 +33,53 @@ fn prompt_new_password() -> error::Result<String> {
         .map_err(|e| error::EnvsGateError::InvalidInput(format!("Password prompt failed: {e}")))
 }
 
-fn resolve_log_path(cli_log_path: &Option<String>) -> String {
-    cli_log_path
+fn validate_namespace(ns: &str) -> error::Result<()> {
+    if ns.is_empty() || ns == "." || ns == ".." {
+        return Err(error::EnvsGateError::InvalidInput(
+            "Invalid namespace name".into(),
+        ));
+    }
+    if !ns
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(error::EnvsGateError::InvalidInput(
+            "Namespace must contain only alphanumeric characters, hyphens, and underscores".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn torii_home() -> error::Result<String> {
+    let home = std::env::var("HOME")
+        .map_err(|_| error::EnvsGateError::InvalidInput("HOME not set".into()))?;
+    Ok(format!("{home}/.torii"))
+}
+
+fn resolve_paths(
+    db_path: &Option<String>,
+    namespace: &str,
+    log_path: &Option<String>,
+) -> error::Result<(String, String)> {
+    if let Some(db) = db_path {
+        // Explicit db-path: ignore namespace
+        let log = log_path.clone().unwrap_or_else(logger::default_log_path);
+        return Ok((db.clone(), log));
+    }
+
+    validate_namespace(namespace)?;
+    let torii_home = torii_home()?;
+    let ns_dir = format!("{torii_home}/{namespace}");
+    std::fs::create_dir_all(&ns_dir).map_err(|e| {
+        error::EnvsGateError::InvalidInput(format!("Cannot create namespace directory: {e}"))
+    })?;
+
+    let db = format!("{ns_dir}/torii.db");
+    let log = log_path
         .clone()
-        .unwrap_or_else(logger::default_log_path)
+        .unwrap_or_else(|| format!("{ns_dir}/audit.log"));
+
+    Ok((db, log))
 }
 
 fn open_logger(log_path: &str) -> error::Result<logger::Logger> {
@@ -62,15 +105,21 @@ fn unwrap_dek_logged(
 
 fn main() -> error::Result<()> {
     let cli = Cli::parse();
-    let log_path = resolve_log_path(&cli.log_path);
+
+    // Handle namespaces command before resolving paths (no DB needed)
+    if matches!(cli.command, Some(Commands::Namespaces)) {
+        return cmd_namespaces();
+    }
+
+    let (db_path, log_path) = resolve_paths(&cli.db_path, &cli.namespace, &cli.log_path)?;
     let mut log = Some(open_logger(&log_path)?);
 
     match cli.command {
-        None => return tui::run_interactive(&cli.db_path, Some(&log_path)),
+        None => return tui::run_interactive(&db_path, Some(&log_path)),
         Some(Commands::Set { key_value, expires }) => {
             let mut password = prompt_password()?;
             let result = cmd_set(
-                &cli.db_path,
+                &db_path,
                 &password,
                 &key_value,
                 expires.as_deref(),
@@ -81,31 +130,31 @@ fn main() -> error::Result<()> {
         }
         Some(Commands::Get { key }) => {
             let mut password = prompt_password()?;
-            let result = cmd_get(&cli.db_path, &password, &key, &mut log);
+            let result = cmd_get(&db_path, &password, &key, &mut log);
             password.zeroize();
             result?;
         }
         Some(Commands::List) => {
             let mut password = prompt_password()?;
-            let result = cmd_list(&cli.db_path, &password, &mut log);
+            let result = cmd_list(&db_path, &password, &mut log);
             password.zeroize();
             result?;
         }
         Some(Commands::Delete { key }) => {
             let mut password = prompt_password()?;
-            let result = cmd_delete(&cli.db_path, &password, &key, &mut log);
+            let result = cmd_delete(&db_path, &password, &key, &mut log);
             password.zeroize();
             result?;
         }
         Some(Commands::Serve { env_path, once }) => {
             let mut password = prompt_password()?;
-            let result = cmd_serve(&cli.db_path, &password, &env_path, once, &mut log);
+            let result = cmd_serve(&db_path, &password, &env_path, once, &mut log);
             password.zeroize();
             result?;
         }
         Some(Commands::Exec { command }) => {
             let mut password = prompt_password()?;
-            let result = cmd_exec(&cli.db_path, &password, &command, &mut log);
+            let result = cmd_exec(&db_path, &password, &command, &mut log);
             password.zeroize();
             let code = result?;
             std::process::exit(code);
@@ -114,17 +163,18 @@ fn main() -> error::Result<()> {
             let old_password = prompt_password_with_message("Old password: ")?;
             let mut new_password = prompt_new_password()?;
             let mut old_pw = old_password;
-            let result = cmd_rotate_password(&cli.db_path, &old_pw, &new_password, &mut log);
+            let result = cmd_rotate_password(&db_path, &old_pw, &new_password, &mut log);
             old_pw.zeroize();
             new_password.zeroize();
             result?;
         }
         Some(Commands::RotateDek) => {
             let mut password = prompt_password()?;
-            let result = cmd_rotate_dek(&cli.db_path, &password, &mut log);
+            let result = cmd_rotate_dek(&db_path, &password, &mut log);
             password.zeroize();
             result?;
         }
+        Some(Commands::Namespaces) => unreachable!(),
         Some(Commands::Logs { format }) => {
             let fmt = match format.as_str() {
                 "json" => logger::LogFormat::Json,
@@ -480,6 +530,38 @@ pub fn cmd_exec(
     Ok(status
         .code()
         .unwrap_or_else(|| status.signal().map_or(1, |sig| 128 + sig)))
+}
+
+pub fn cmd_namespaces() -> error::Result<()> {
+    let torii_home = torii_home()?;
+    let path = std::path::Path::new(&torii_home);
+
+    if !path.exists() {
+        eprintln!("No namespaces found.");
+        return Ok(());
+    }
+
+    let mut entries: Vec<String> = std::fs::read_dir(path)
+        .map_err(|e| error::EnvsGateError::InvalidInput(format!("Cannot read directory: {e}")))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir() && e.path().join("torii.db").exists())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    entries.sort();
+
+    if entries.is_empty() {
+        eprintln!("No namespaces found.");
+    } else {
+        for ns in &entries {
+            if ns == "default" {
+                println!("{ns} (default)");
+            } else {
+                println!("{ns}");
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub fn cmd_rotate_password(
@@ -1080,6 +1162,91 @@ mod tests {
             serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert_eq!(entry.action, "rotate_dek");
         assert!(entry.detail.unwrap().contains("reencrypted=2"));
+    }
+
+    // --- namespace テスト ---
+
+    #[test]
+    fn validate_namespace_valid() {
+        assert!(validate_namespace("default").is_ok());
+        assert!(validate_namespace("my-project").is_ok());
+        assert!(validate_namespace("project_1").is_ok());
+        assert!(validate_namespace("ABC123").is_ok());
+    }
+
+    #[test]
+    fn validate_namespace_invalid() {
+        assert!(validate_namespace("").is_err());
+        assert!(validate_namespace(".").is_err());
+        assert!(validate_namespace("..").is_err());
+        assert!(validate_namespace("foo/bar").is_err());
+        assert!(validate_namespace("foo bar").is_err());
+        assert!(validate_namespace("a@b").is_err());
+    }
+
+    #[test]
+    fn resolve_paths_explicit_db_path_ignores_namespace() {
+        let (db, _log) = resolve_paths(&Some("./custom.db".into()), "myproject", &None).unwrap();
+        assert_eq!(db, "./custom.db");
+    }
+
+    #[test]
+    fn resolve_paths_namespace_creates_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        unsafe { std::env::set_var("HOME", home) };
+
+        let (db, log) = resolve_paths(&None, "testns", &None).unwrap();
+
+        assert!(db.contains("/.torii/testns/torii.db"));
+        assert!(log.contains("/.torii/testns/audit.log"));
+        assert!(std::path::Path::new(&format!("{home}/.torii/testns")).is_dir());
+    }
+
+    #[test]
+    fn resolve_paths_explicit_log_path_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        unsafe { std::env::set_var("HOME", home) };
+
+        let (_, log) = resolve_paths(&None, "default", &Some("/tmp/custom.log".into())).unwrap();
+        assert_eq!(log, "/tmp/custom.log");
+    }
+
+    #[test]
+    fn resolve_paths_invalid_namespace_fails() {
+        assert!(resolve_paths(&None, "../escape", &None).is_err());
+        assert!(resolve_paths(&None, "", &None).is_err());
+    }
+
+    #[test]
+    fn cmd_namespaces_with_no_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        unsafe { std::env::set_var("HOME", home) };
+
+        // Should not error even if ~/.torii doesn't exist
+        assert!(cmd_namespaces().is_ok());
+    }
+
+    #[test]
+    fn cmd_namespaces_lists_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        unsafe { std::env::set_var("HOME", home) };
+
+        // Create namespace directories with DBs
+        let ns1 = format!("{home}/.torii/alpha");
+        let ns2 = format!("{home}/.torii/beta");
+        let ns_empty = format!("{home}/.torii/empty");
+        std::fs::create_dir_all(&ns1).unwrap();
+        std::fs::create_dir_all(&ns2).unwrap();
+        std::fs::create_dir_all(&ns_empty).unwrap();
+        std::fs::write(format!("{ns1}/torii.db"), b"").unwrap();
+        std::fs::write(format!("{ns2}/torii.db"), b"").unwrap();
+        // ns_empty has no torii.db, should not appear
+
+        assert!(cmd_namespaces().is_ok());
     }
 
     #[test]

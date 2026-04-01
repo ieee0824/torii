@@ -6,9 +6,13 @@ use clap::{Parser, Subcommand};
     about = "Protect environment variables with hybrid PQC encryption"
 )]
 pub struct Cli {
-    /// Path to the SQLite database file
-    #[arg(long, default_value = "torii.db")]
-    pub db_path: String,
+    /// Path to the SQLite database file (overrides --namespace)
+    #[arg(long)]
+    pub db_path: Option<String>,
+
+    /// Namespace for isolating databases
+    #[arg(short = 'n', long, default_value = "default")]
+    pub namespace: String,
 
     /// Path to the audit log file
     #[arg(long)]
@@ -68,6 +72,9 @@ pub enum Commands {
 
     /// Rotate DEK (generate new DEK and re-encrypt all values)
     RotateDek,
+
+    /// List all namespaces
+    Namespaces,
 
     /// View audit logs
     Logs {
