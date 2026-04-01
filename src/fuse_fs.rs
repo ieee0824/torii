@@ -55,11 +55,14 @@ pub fn serve(db_path: &str, dek: &[u8; 32], env_path: &str, once: bool) -> Resul
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EEXIST) {
             return Err(EnvsGateError::Fuse(format!(
-                "File already exists at {}", path.display()
+                "File already exists at {}",
+                path.display()
             )));
         }
         return Err(EnvsGateError::Fuse(format!(
-            "mkfifo failed at {}: {}", path.display(), err
+            "mkfifo failed at {}: {}",
+            path.display(),
+            err
         )));
     }
 

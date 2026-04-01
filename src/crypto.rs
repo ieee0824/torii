@@ -1,11 +1,8 @@
-use aes_gcm::{
-    Aes256Gcm, KeyInit, Nonce,
-    aead::Aead,
-};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use argon2::Argon2;
 use hkdf::Hkdf;
+use ml_kem::kem::{Decapsulate, Encapsulate};
 use ml_kem::{Ciphertext, EncodedSizeUser, KemCore, MlKem768};
-use ml_kem::kem::{Encapsulate, Decapsulate};
 use rand::rngs::OsRng;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
@@ -144,9 +141,8 @@ pub fn unwrap_dek(password: &str, meta: &VaultMetadata) -> Result<[u8; DEK_LEN]>
     let ss_x25519 = x25519_static_secret.diffie_hellman(&x25519_eph_pub);
 
     // ML-KEM decapsulate
-    let ct_kem: Ciphertext<MlKem768> =
-        ml_kem::array::Array::try_from(meta.ct_kem.as_slice())
-            .map_err(|_| EnvsGateError::Crypto("Invalid ML-KEM ciphertext length".into()))?;
+    let ct_kem: Ciphertext<MlKem768> = ml_kem::array::Array::try_from(meta.ct_kem.as_slice())
+        .map_err(|_| EnvsGateError::Crypto("Invalid ML-KEM ciphertext length".into()))?;
     let ss_kem = dk_kem
         .decapsulate(&ct_kem)
         .map_err(|_| EnvsGateError::Crypto("ML-KEM decapsulate failed".into()))?;
@@ -207,3 +203,74 @@ pub fn decrypt_value(dek: &[u8; DEK_LEN], nonce: &[u8], ciphertext: &[u8]) -> Re
 }
 
 use rand::RngCore;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_vault_and_unwrap_dek_roundtrip() {
+        let (meta, dek) = init_vault("test-password").unwrap();
+        let recovered_dek = unwrap_dek("test-password", &meta).unwrap();
+        assert_eq!(dek, recovered_dek);
+    }
+
+    #[test]
+    fn unwrap_dek_wrong_password() {
+        let (meta, _dek) = init_vault("correct-password").unwrap();
+        let result = unwrap_dek("wrong-password", &meta);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn encrypt_decrypt_value_roundtrip() {
+        let (_, dek) = init_vault("pw").unwrap();
+        let plaintext = b"super-secret-value";
+        let (nonce, ciphertext) = encrypt_value(&dek, plaintext).unwrap();
+        let recovered = decrypt_value(&dek, &nonce, &ciphertext).unwrap();
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn decrypt_with_wrong_dek_fails() {
+        let (_, dek) = init_vault("pw1").unwrap();
+        let (_, other_dek) = init_vault("pw2").unwrap();
+        let (nonce, ciphertext) = encrypt_value(&dek, b"secret").unwrap();
+        let result = decrypt_value(&other_dek, &nonce, &ciphertext);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decrypt_with_tampered_ciphertext_fails() {
+        let (_, dek) = init_vault("pw").unwrap();
+        let (nonce, mut ciphertext) = encrypt_value(&dek, b"secret").unwrap();
+        ciphertext[0] ^= 0xff;
+        let result = decrypt_value(&dek, &nonce, &ciphertext);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn different_inits_produce_different_deks() {
+        let (_, dek1) = init_vault("same-password").unwrap();
+        let (_, dek2) = init_vault("same-password").unwrap();
+        // DEKs are random, so they should differ even with same password
+        assert_ne!(dek1, dek2);
+    }
+
+    #[test]
+    fn encrypt_empty_value() {
+        let (_, dek) = init_vault("pw").unwrap();
+        let (nonce, ciphertext) = encrypt_value(&dek, b"").unwrap();
+        let recovered = decrypt_value(&dek, &nonce, &ciphertext).unwrap();
+        assert_eq!(recovered, b"");
+    }
+
+    #[test]
+    fn encrypt_large_value() {
+        let (_, dek) = init_vault("pw").unwrap();
+        let large = vec![0xABu8; 1024 * 1024]; // 1MB
+        let (nonce, ciphertext) = encrypt_value(&dek, &large).unwrap();
+        let recovered = decrypt_value(&dek, &nonce, &ciphertext).unwrap();
+        assert_eq!(recovered, large);
+    }
+}

@@ -157,3 +157,146 @@ pub fn delete_env_var(conn: &Connection, key: &str) -> Result<bool> {
     let affected = conn.execute("DELETE FROM env_vars WHERE key_name = ?1", params![key])?;
     Ok(affected > 0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> Connection {
+        open_or_create_db(":memory:").unwrap()
+    }
+
+    #[test]
+    fn fresh_db_is_not_initialized() {
+        let conn = test_db();
+        assert!(!is_initialized(&conn).unwrap());
+    }
+
+    #[test]
+    fn load_metadata_empty_returns_none() {
+        let conn = test_db();
+        assert!(load_metadata(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn store_and_load_metadata_roundtrip() {
+        let conn = test_db();
+        let meta = VaultMetadata {
+            salt: vec![1; 16],
+            ek_kem: vec![2; 32],
+            x25519_pub: vec![3; 32],
+            ct_kem: vec![4; 32],
+            x25519_eph: vec![5; 32],
+            wrap_nonce: vec![6; 12],
+            wrapped_dek: vec![7; 48],
+        };
+        store_metadata(&conn, &meta).unwrap();
+
+        assert!(is_initialized(&conn).unwrap());
+
+        let loaded = load_metadata(&conn).unwrap().unwrap();
+        assert_eq!(loaded.salt, meta.salt);
+        assert_eq!(loaded.ek_kem, meta.ek_kem);
+        assert_eq!(loaded.x25519_pub, meta.x25519_pub);
+        assert_eq!(loaded.wrapped_dek, meta.wrapped_dek);
+    }
+
+    #[test]
+    fn store_metadata_twice_fails() {
+        let conn = test_db();
+        let meta = VaultMetadata {
+            salt: vec![1; 16],
+            ek_kem: vec![2; 32],
+            x25519_pub: vec![3; 32],
+            ct_kem: vec![4; 32],
+            x25519_eph: vec![5; 32],
+            wrap_nonce: vec![6; 12],
+            wrapped_dek: vec![7; 48],
+        };
+        store_metadata(&conn, &meta).unwrap();
+        assert!(store_metadata(&conn, &meta).is_err());
+    }
+
+    #[test]
+    fn upsert_and_get_env_var() {
+        let conn = test_db();
+        upsert_env_var(&conn, "KEY1", b"nonce123456!", b"cipher", None).unwrap();
+
+        let var = get_env_var(&conn, "KEY1").unwrap().unwrap();
+        assert_eq!(var.key_name, "KEY1");
+        assert_eq!(var.nonce, b"nonce123456!");
+        assert_eq!(var.ciphertext, b"cipher");
+        assert!(var.expires_at.is_none());
+    }
+
+    #[test]
+    fn upsert_overwrites_existing() {
+        let conn = test_db();
+        upsert_env_var(&conn, "KEY1", b"nonce1_12byte", b"value1", None).unwrap();
+        upsert_env_var(
+            &conn,
+            "KEY1",
+            b"nonce2_12byte",
+            b"value2",
+            Some("2030-01-01"),
+        )
+        .unwrap();
+
+        let var = get_env_var(&conn, "KEY1").unwrap().unwrap();
+        assert_eq!(var.ciphertext, b"value2");
+        assert_eq!(var.expires_at.as_deref(), Some("2030-01-01"));
+    }
+
+    #[test]
+    fn get_nonexistent_key_returns_none() {
+        let conn = test_db();
+        assert!(get_env_var(&conn, "MISSING").unwrap().is_none());
+    }
+
+    #[test]
+    fn list_env_vars_sorted() {
+        let conn = test_db();
+        upsert_env_var(&conn, "ZEBRA", b"nonce_12bytes", b"z", None).unwrap();
+        upsert_env_var(&conn, "APPLE", b"nonce_12bytes", b"a", None).unwrap();
+        upsert_env_var(&conn, "MANGO", b"nonce_12bytes", b"m", None).unwrap();
+
+        let vars = list_env_vars(&conn).unwrap();
+        let keys: Vec<&str> = vars.iter().map(|v| v.key_name.as_str()).collect();
+        assert_eq!(keys, vec!["APPLE", "MANGO", "ZEBRA"]);
+    }
+
+    #[test]
+    fn list_empty_returns_empty() {
+        let conn = test_db();
+        assert!(list_env_vars(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_existing_key() {
+        let conn = test_db();
+        upsert_env_var(&conn, "KEY1", b"nonce_12bytes", b"val", None).unwrap();
+        assert!(delete_env_var(&conn, "KEY1").unwrap());
+        assert!(get_env_var(&conn, "KEY1").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_nonexistent_key_returns_false() {
+        let conn = test_db();
+        assert!(!delete_env_var(&conn, "MISSING").unwrap());
+    }
+
+    #[test]
+    fn env_var_with_expires() {
+        let conn = test_db();
+        upsert_env_var(
+            &conn,
+            "TEMP",
+            b"nonce_12bytes",
+            b"val",
+            Some("2025-12-31T23:59:59"),
+        )
+        .unwrap();
+        let var = get_env_var(&conn, "TEMP").unwrap().unwrap();
+        assert_eq!(var.expires_at.as_deref(), Some("2025-12-31T23:59:59"));
+    }
+}
