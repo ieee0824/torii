@@ -88,6 +88,13 @@ fn main() -> error::Result<()> {
             password.zeroize();
             result?;
         }
+        Some(Commands::Exec { command }) => {
+            let mut password = prompt_password()?;
+            let result = cmd_exec(&cli.db_path, &password, &command, &mut log);
+            password.zeroize();
+            let code = result?;
+            std::process::exit(code);
+        }
         Some(Commands::Logs { format }) => {
             let fmt = match format.as_str() {
                 "json" => logger::LogFormat::Json,
@@ -339,6 +346,112 @@ pub fn cmd_serve(
     fuse_fs::serve(db_path, &dek, env_path, once)
 }
 
+static CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn forward_signal_to_child(sig: libc::c_int) {
+    let pid = CHILD_PID.load(std::sync::atomic::Ordering::SeqCst);
+    if pid > 0 {
+        unsafe {
+            libc::kill(pid, sig);
+        }
+    }
+}
+
+fn install_signal_forwarder() {
+    unsafe {
+        for sig in [libc::SIGTERM, libc::SIGINT] {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = forward_signal_to_child as *const () as usize;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+pub fn cmd_exec(
+    db_path: &str,
+    password: &str,
+    command: &[String],
+    log: &mut Option<logger::Logger>,
+) -> error::Result<i32> {
+    if command.is_empty() {
+        return Err(error::EnvsGateError::InvalidInput(
+            "No command specified".into(),
+        ));
+    }
+
+    let conn = db::open_or_create_db(db_path)?;
+    let meta = db::load_metadata(&conn)?
+        .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
+    let dek = unwrap_dek_logged(password, &meta, log)?;
+
+    let vars = db::list_env_vars(&conn)?;
+    let mut env_pairs = Vec::new();
+
+    for var in &vars {
+        if let Some(ref exp) = var.expires_at
+            && is_expired(exp)
+        {
+            if let Some(l) = log {
+                l.log_expired(&var.key_name);
+            }
+            return Err(error::EnvsGateError::KeyExpired {
+                key: var.key_name.clone(),
+                expired_at: exp.clone(),
+            });
+        }
+
+        let plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
+        let value = String::from_utf8(plaintext).map_err(|e| {
+            let mut bytes = e.into_bytes();
+            bytes.zeroize();
+            error::EnvsGateError::InvalidInput(format!(
+                "Value for '{}' contains invalid UTF-8",
+                var.key_name
+            ))
+        })?;
+        env_pairs.push((var.key_name.clone(), value));
+    }
+
+    if let Some(l) = log {
+        l.log_exec(&command[0], env_pairs.len());
+    }
+
+    let program = &command[0];
+    let args = &command[1..];
+
+    // Install signal handlers before spawn so no window exists
+    // where a signal could kill the parent without forwarding.
+    install_signal_forwarder();
+
+    // NOTE: On Linux, injected env vars are visible via /proc/<pid>/environ
+    // to the process owner and root. This is an OS-level constraint.
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .envs(env_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .spawn()
+        .map_err(|e| {
+            error::EnvsGateError::InvalidInput(format!("Failed to execute '{program}': {e}"))
+        })?;
+
+    // Zeroize decrypted values immediately after spawn
+    for (_, mut val) in env_pairs {
+        val.zeroize();
+    }
+
+    CHILD_PID.store(child.id() as i32, std::sync::atomic::Ordering::SeqCst);
+
+    let status = child.wait().map_err(|e| {
+        error::EnvsGateError::InvalidInput(format!("Failed to wait for child process: {e}"))
+    })?;
+
+    use std::os::unix::process::ExitStatusExt;
+    Ok(status
+        .code()
+        .unwrap_or_else(|| status.signal().map_or(1, |sig| 128 + sig)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,5 +678,125 @@ mod tests {
             .map(|l| serde_json::from_str::<logger::LogEntry>(l).unwrap().action)
             .collect();
         assert_eq!(actions, vec!["set", "get", "list", "delete"]);
+    }
+
+    // --- exec テスト ---
+
+    #[test]
+    fn exec_empty_command_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
+        let result = cmd_exec(db_path, "pw", &[], &mut None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exec_wrong_password_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
+        let result = cmd_exec(
+            db_path,
+            "wrong",
+            &["echo".into(), "hello".into()],
+            &mut None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exec_with_expired_key_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "OLD=val", Some("2000-01-01"), &mut None).unwrap();
+        let result = cmd_exec(db_path, "pw", &["echo".into()], &mut None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exec_uninitialized_db_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        let result = cmd_exec(db_path, "pw", &["echo".into()], &mut None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exec_injects_env_vars() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+        let out_file = dir.path().join("out.txt");
+
+        cmd_set(db_path, "pw", "TORII_TEST_VAR=hello123", None, &mut None).unwrap();
+
+        let cmd = vec![
+            "sh".into(),
+            "-c".into(),
+            format!("echo $TORII_TEST_VAR > {}", out_file.display()),
+        ];
+        let code = cmd_exec(db_path, "pw", &cmd, &mut None).unwrap();
+        assert_eq!(code, 0);
+
+        let content = std::fs::read_to_string(&out_file).unwrap();
+        assert_eq!(content.trim(), "hello123");
+    }
+
+    #[test]
+    fn exec_returns_child_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
+
+        let cmd = vec!["sh".into(), "-c".into(), "exit 42".into()];
+        let code = cmd_exec(db_path, "pw", &cmd, &mut None).unwrap();
+        assert_eq!(code, 42);
+    }
+
+    #[test]
+    fn exec_signal_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
+
+        // Child sends SIGKILL to itself → exit code should be 128 + 9 = 137
+        let cmd = vec!["sh".into(), "-c".into(), "kill -9 $$".into()];
+        let code = cmd_exec(db_path, "pw", &cmd, &mut None).unwrap();
+        assert_eq!(code, 137);
+    }
+
+    #[test]
+    fn exec_logs_audit_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+        let log_path = dir.path().join("audit.log");
+
+        cmd_set(db_path, "pw", "A=1", None, &mut None).unwrap();
+        cmd_set(db_path, "pw", "B=2", None, &mut None).unwrap();
+
+        let mut log = Some(logger::Logger::open(log_path.to_str().unwrap()).unwrap());
+        let cmd = vec!["true".into()];
+        cmd_exec(db_path, "pw", &cmd, &mut log).unwrap();
+        drop(log);
+
+        let content = std::fs::read_to_string(&log_path).unwrap();
+        let entry: logger::LogEntry =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(entry.action, "exec");
+        assert!(entry.detail.unwrap().contains("keys_injected=2"));
     }
 }
