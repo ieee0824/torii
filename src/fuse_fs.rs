@@ -96,19 +96,17 @@ pub fn serve(
         let file = if let Some(secs) = timeout.filter(|_| has_been_read) {
             let path_clone = path.clone();
             let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
+            let handle = std::thread::spawn(move || {
                 let result = std::fs::OpenOptions::new().write(true).open(&path_clone);
                 let _ = tx.send(result);
             });
             match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
                 Ok(result) => result,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(_) => {
                     eprintln!("Timeout: no reader for {secs}s, stopping.");
+                    // Remove FIFO to unblock the spawned thread's open() call
                     let _ = std::fs::remove_file(&path);
-                    return Ok(());
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    let _ = std::fs::remove_file(&path);
+                    let _ = handle.join();
                     return Ok(());
                 }
             }
