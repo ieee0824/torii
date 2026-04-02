@@ -105,6 +105,7 @@ cargo install --path .
 
 ```bash
 cargo build --release --bin docker-torii
+mkdir -p ~/.docker/cli-plugins
 cp target/release/docker-torii ~/.docker/cli-plugins/
 ```
 

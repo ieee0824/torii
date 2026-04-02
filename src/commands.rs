@@ -166,7 +166,7 @@ pub fn parse_expires(input: &str) -> error::Result<String> {
     )))
 }
 
-fn is_expired(expires_at: &str) -> bool {
+pub fn is_expired(expires_at: &str) -> bool {
     let now = Local::now().naive_local();
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%dT%H:%M:%S") {
         return now > dt;
