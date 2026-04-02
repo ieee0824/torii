@@ -176,18 +176,37 @@ fn run(
         let _ = std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o400));
     }
 
+    // Register signal handler to clean up tmpfs on Ctrl+C / SIGTERM
+    let tmp_dir_for_signal = tmp_dir.clone();
+    ctrlc::set_handler(move || {
+        cleanup_tmpfs_dir(&tmp_dir_for_signal);
+        std::process::exit(130);
+    })
+    .map_err(|e| {
+        cleanup_tmpfs_dir(&tmp_dir);
+        error::EnvsGateError::InvalidInput(format!("Cannot set signal handler: {e}"))
+    })?;
+
     let mount_arg = format!(
         "type=bind,src={},dst={},readonly",
         env_file.display(),
         env_path
     );
 
-    let status = Command::new("docker")
+    let status = match Command::new("docker")
         .arg("run")
         .args(["--mount", &mount_arg])
         .args(docker_args)
         .status()
-        .map_err(|e| error::EnvsGateError::InvalidInput(format!("Failed to run docker: {e}")))?;
+    {
+        Ok(s) => s,
+        Err(e) => {
+            cleanup_tmpfs_dir(&tmp_dir);
+            return Err(error::EnvsGateError::InvalidInput(format!(
+                "Failed to run docker: {e}"
+            )));
+        }
+    };
 
     cleanup_tmpfs_dir(&tmp_dir);
 
