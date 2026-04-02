@@ -112,22 +112,22 @@ fn create_secure_tmpdir() -> error::Result<PathBuf> {
     {
         // /dev/shm is a user-accessible tmpfs on most Linux distributions
         let shm = Path::new("/dev/shm");
-        if shm.is_dir() {
-            if let Ok(dir) = tempfile::Builder::new().prefix("torii-").tempdir_in(shm) {
-                let path = dir.keep();
-                set_dir_permissions(&path)?;
-                return Ok(path);
-            }
+        if shm.is_dir()
+            && let Ok(dir) = tempfile::Builder::new().prefix("torii-").tempdir_in(shm)
+        {
+            let path = dir.keep();
+            set_dir_permissions(&path)?;
+            return Ok(path);
         }
         // $XDG_RUNTIME_DIR is typically a per-user tmpfs
         if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
             let rt = Path::new(&runtime_dir);
-            if rt.is_dir() {
-                if let Ok(dir) = tempfile::Builder::new().prefix("torii-").tempdir_in(rt) {
-                    let path = dir.keep();
-                    set_dir_permissions(&path)?;
-                    return Ok(path);
-                }
+            if rt.is_dir()
+                && let Ok(dir) = tempfile::Builder::new().prefix("torii-").tempdir_in(rt)
+            {
+                let path = dir.keep();
+                set_dir_permissions(&path)?;
+                return Ok(path);
             }
         }
     }
@@ -297,7 +297,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["SchemaVersion"], "0.1.0");
         assert_eq!(parsed["Vendor"], "torii");
-        assert!(parsed["ShortDescription"].as_str().unwrap().len() > 0);
+        assert!(!parsed["ShortDescription"].as_str().unwrap().is_empty());
     }
 
     #[test]
