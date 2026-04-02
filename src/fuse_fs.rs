@@ -33,7 +33,13 @@ fn generate_env_content(db_path: &str, dek: &[u8; 32]) -> Result<Vec<u8>> {
     Ok(content.into_bytes())
 }
 
-pub fn serve(db_path: &str, dek: &[u8; 32], env_path: &str, once: bool) -> Result<()> {
+pub fn serve(
+    db_path: &str,
+    dek: &[u8; 32],
+    env_path: &str,
+    once: bool,
+    timeout: Option<u64>,
+) -> Result<()> {
     let path = Path::new(env_path);
 
     // Resolve to absolute path
@@ -80,14 +86,38 @@ pub fn serve(db_path: &str, dek: &[u8; 32], env_path: &str, once: bool) -> Resul
 
     let db_path = db_path.to_string();
     let dek = *dek;
+    let mut has_been_read = false;
 
     // Loop: each iteration serves one reader
     loop {
-        // open for writing blocks until a reader opens the pipe
-        let file = std::fs::OpenOptions::new().write(true).open(&path);
+        // Wait for a reader to connect.
+        // When timeout is active (after first read), use O_NONBLOCK + poll
+        // to avoid spawning threads and to make timeout reliably enforceable.
+        let file = if let Some(secs) = timeout.filter(|_| has_been_read) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            loop {
+                match open_fifo_nonblock(&path) {
+                    Ok(Some(f)) => break Ok(f),
+                    Ok(None) => {
+                        // No reader yet — check deadline
+                        if std::time::Instant::now() >= deadline {
+                            eprintln!("Timeout: no reader for {secs}s, stopping.");
+                            let _ = std::fs::remove_file(&path);
+                            return Ok(());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
+        } else {
+            // Blocking open — waits indefinitely for a reader
+            std::fs::OpenOptions::new().write(true).open(&path)
+        };
 
         match file {
             Ok(mut f) => {
+                has_been_read = true;
                 match generate_env_content(&db_path, &dek) {
                     Ok(content) => {
                         let _ = f.write_all(&content);
@@ -113,4 +143,20 @@ pub fn serve(db_path: &str, dek: &[u8; 32], env_path: &str, once: bool) -> Resul
     }
 
     Ok(())
+}
+
+/// Try to open a FIFO for writing with O_NONBLOCK.
+/// Returns Ok(Some(file)) if a reader is connected, Ok(None) if ENXIO (no reader yet),
+/// or Err for other failures.
+fn open_fifo_nonblock(path: &Path) -> std::result::Result<Option<std::fs::File>, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.raw_os_error() == Some(libc::ENXIO) => Ok(None),
+        Err(e) => Err(e),
+    }
 }

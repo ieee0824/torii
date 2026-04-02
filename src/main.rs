@@ -206,9 +206,13 @@ fn main() -> error::Result<()> {
             password.zeroize();
             result?;
         }
-        Some(Commands::Serve { env_path, once }) => {
+        Some(Commands::Serve {
+            env_path,
+            once,
+            timeout,
+        }) => {
             let mut password = prompt_password()?;
-            let result = cmd_serve(&db_path, &password, &env_path, once, &mut log);
+            let result = cmd_serve(&db_path, &password, &env_path, once, timeout, &mut log);
             password.zeroize();
             result?;
         }
@@ -457,6 +461,7 @@ pub fn cmd_serve(
     password: &str,
     env_path: &str,
     once: bool,
+    timeout: Option<u64>,
     log: &mut Option<logger::Logger>,
 ) -> error::Result<()> {
     let conn = db::open_or_create_db(db_path)?;
@@ -480,10 +485,10 @@ pub fn cmd_serve(
     }
 
     if let Some(l) = log {
-        l.log_serve(env_path, once);
+        l.log_serve(env_path, once, timeout);
     }
 
-    fuse_fs::serve(db_path, &dek, env_path, once)
+    fuse_fs::serve(db_path, &dek, env_path, once, timeout)
 }
 
 static CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);

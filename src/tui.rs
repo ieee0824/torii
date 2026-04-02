@@ -142,5 +142,5 @@ fn interactive_serve(db_path: &str, password: &str, log: &mut Option<Logger>) ->
         .interact()
         .map_err(io_err)?;
 
-    cmd_serve(db_path, password, &env_path, once, log)
+    cmd_serve(db_path, password, &env_path, once, None, log)
 }

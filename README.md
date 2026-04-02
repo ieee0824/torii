@@ -196,6 +196,12 @@ torii serve -e .env
 torii serve -e .env --once
 ```
 
+最後の読み込みから一定時間後に自動終了（docker compose 等の複数回読み込みに対応）:
+
+```
+torii serve -e .env --timeout 10
+```
+
 Named pipe（FIFO）として指定パスに仮想`.env`ファイルを作成する。
 `cat`やアプリケーションから読み取ると、その瞬間に復号された環境変数が返される。
 ディスクに平文は残らない。Ctrl+Cで停止・パイプ削除。
@@ -204,6 +210,7 @@ Named pipe（FIFO）として指定パスに仮想`.env`ファイルを作成す
 - macOS / Linux 両対応（POSIX標準）
 - 読み取りのたびに動的に復号（キャッシュなし）
 - serve中に期限切れを検出した場合はstderrに警告を出力
+- `--timeout N`: 最後の読み込みからN秒間新たな読み込みがなければ自動終了
 
 #### パスワードローテーション
 
@@ -276,6 +283,7 @@ torii namespaces                      # namespace 一覧表示
 | `--expires <duration>` | 有効期限（`set`時） | なし |
 | `-e, --env-path <path>` | 仮想.envのパス（`serve`時） | `.env` |
 | `--once` | 1回読まれたら終了（`serve`時） | off |
+| `--timeout <seconds>` | 最後の読み込みからN秒で自動終了（`serve`時） | なし |
 
 ## セキュリティ
 
