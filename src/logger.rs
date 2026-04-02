@@ -157,8 +157,9 @@ impl Logger {
         self.log(&LogEntry::new("delete", Some(key), None));
     }
 
-    pub fn log_serve(&mut self, env_path: &str, once: bool) {
-        let detail = format!("path={env_path}, once={once}");
+    pub fn log_serve(&mut self, env_path: &str, once: bool, timeout: Option<u64>) {
+        let timeout_str = timeout.map_or("none".into(), |t| format!("{t}s"));
+        let detail = format!("path={env_path}, once={once}, timeout={timeout_str}");
         self.log(&LogEntry::new("serve", None, Some(&detail)));
     }
 

@@ -33,7 +33,13 @@ fn generate_env_content(db_path: &str, dek: &[u8; 32]) -> Result<Vec<u8>> {
     Ok(content.into_bytes())
 }
 
-pub fn serve(db_path: &str, dek: &[u8; 32], env_path: &str, once: bool) -> Result<()> {
+pub fn serve(
+    db_path: &str,
+    dek: &[u8; 32],
+    env_path: &str,
+    once: bool,
+    timeout: Option<u64>,
+) -> Result<()> {
     let path = Path::new(env_path);
 
     // Resolve to absolute path
@@ -83,8 +89,26 @@ pub fn serve(db_path: &str, dek: &[u8; 32], env_path: &str, once: bool) -> Resul
 
     // Loop: each iteration serves one reader
     loop {
-        // open for writing blocks until a reader opens the pipe
-        let file = std::fs::OpenOptions::new().write(true).open(&path);
+        // FIFO open for writing blocks until a reader connects.
+        // When timeout is set, use a background thread so we can time out.
+        let file = if let Some(secs) = timeout {
+            let path_clone = path.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = std::fs::OpenOptions::new().write(true).open(&path_clone);
+                let _ = tx.send(result);
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+                Ok(result) => result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    eprintln!("Timeout: no reader for {secs}s, stopping.");
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            std::fs::OpenOptions::new().write(true).open(&path)
+        };
 
         match file {
             Ok(mut f) => {

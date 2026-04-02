@@ -58,6 +58,10 @@ pub enum Commands {
         /// Exit after the first read
         #[arg(long)]
         once: bool,
+
+        /// Exit after N seconds of inactivity since last read
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 
     /// Execute a command with decrypted environment variables injected
