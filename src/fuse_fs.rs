@@ -104,9 +104,11 @@ pub fn serve(
                 Ok(result) => result,
                 Err(_) => {
                     eprintln!("Timeout: no reader for {secs}s, stopping.");
-                    // Remove FIFO to unblock the spawned thread's open() call
-                    let _ = std::fs::remove_file(&path);
+                    // Open FIFO for reading to unblock the spawned thread's
+                    // write-side open(), then remove the FIFO and join.
+                    let _ = std::fs::OpenOptions::new().read(true).open(&path);
                     let _ = handle.join();
+                    let _ = std::fs::remove_file(&path);
                     return Ok(());
                 }
             }
