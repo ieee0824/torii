@@ -86,12 +86,14 @@ pub fn serve(
 
     let db_path = db_path.to_string();
     let dek = *dek;
+    let mut has_been_read = false;
 
     // Loop: each iteration serves one reader
     loop {
         // FIFO open for writing blocks until a reader connects.
-        // When timeout is set, use a background thread so we can time out.
-        let file = if let Some(secs) = timeout {
+        // When timeout is set AND at least one read has occurred,
+        // use a background thread so we can time out on inactivity.
+        let file = if let Some(secs) = timeout.filter(|_| has_been_read) {
             let path_clone = path.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
@@ -102,9 +104,13 @@ pub fn serve(
                 Ok(result) => result,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     eprintln!("Timeout: no reader for {secs}s, stopping.");
-                    break;
+                    let _ = std::fs::remove_file(&path);
+                    return Ok(());
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Ok(());
+                }
             }
         } else {
             std::fs::OpenOptions::new().write(true).open(&path)
@@ -112,6 +118,7 @@ pub fn serve(
 
         match file {
             Ok(mut f) => {
+                has_been_read = true;
                 match generate_env_content(&db_path, &dek) {
                     Ok(content) => {
                         let _ = f.write_all(&content);
