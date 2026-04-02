@@ -90,29 +90,28 @@ pub fn serve(
 
     // Loop: each iteration serves one reader
     loop {
-        // FIFO open for writing blocks until a reader connects.
-        // When timeout is set AND at least one read has occurred,
-        // use a background thread so we can time out on inactivity.
+        // Wait for a reader to connect.
+        // When timeout is active (after first read), use O_NONBLOCK + poll
+        // to avoid spawning threads and to make timeout reliably enforceable.
         let file = if let Some(secs) = timeout.filter(|_| has_been_read) {
-            let path_clone = path.clone();
-            let (tx, rx) = std::sync::mpsc::channel();
-            let handle = std::thread::spawn(move || {
-                let result = std::fs::OpenOptions::new().write(true).open(&path_clone);
-                let _ = tx.send(result);
-            });
-            match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
-                Ok(result) => result,
-                Err(_) => {
-                    eprintln!("Timeout: no reader for {secs}s, stopping.");
-                    // Open FIFO for reading to unblock the spawned thread's
-                    // write-side open(), then remove the FIFO and join.
-                    let _ = std::fs::OpenOptions::new().read(true).open(&path);
-                    let _ = handle.join();
-                    let _ = std::fs::remove_file(&path);
-                    return Ok(());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            loop {
+                match open_fifo_nonblock(&path) {
+                    Ok(Some(f)) => break Ok(f),
+                    Ok(None) => {
+                        // No reader yet — check deadline
+                        if std::time::Instant::now() >= deadline {
+                            eprintln!("Timeout: no reader for {secs}s, stopping.");
+                            let _ = std::fs::remove_file(&path);
+                            return Ok(());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => break Err(e),
                 }
             }
         } else {
+            // Blocking open — waits indefinitely for a reader
             std::fs::OpenOptions::new().write(true).open(&path)
         };
 
@@ -144,4 +143,20 @@ pub fn serve(
     }
 
     Ok(())
+}
+
+/// Try to open a FIFO for writing with O_NONBLOCK.
+/// Returns Ok(Some(file)) if a reader is connected, Ok(None) if ENXIO (no reader yet),
+/// or Err for other failures.
+fn open_fifo_nonblock(path: &Path) -> std::result::Result<Option<std::fs::File>, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.raw_os_error() == Some(libc::ENXIO) => Ok(None),
+        Err(e) => Err(e),
+    }
 }

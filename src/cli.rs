@@ -60,7 +60,7 @@ pub enum Commands {
         once: bool,
 
         /// Exit after N seconds of inactivity since last read
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         timeout: Option<u64>,
     },
 
