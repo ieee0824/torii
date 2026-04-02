@@ -109,10 +109,10 @@ fn create_tmpfs_dir() -> error::Result<std::path::PathBuf> {
             .args(["-t", "tmpfs", "-o", "size=1m,mode=0700", "tmpfs"])
             .arg(&dir)
             .status();
-        if let Ok(s) = status {
-            if s.success() {
-                return Ok(dir);
-            }
+        if let Ok(s) = status
+            && s.success()
+        {
+            return Ok(dir);
         }
         eprintln!("Warning: Could not mount tmpfs, using regular temp directory");
     }
