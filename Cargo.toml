@@ -3,6 +3,18 @@ name = "torii"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "torii"
+path = "src/lib.rs"
+
+[[bin]]
+name = "torii"
+path = "src/main.rs"
+
+[[bin]]
+name = "docker-torii"
+path = "src/docker_plugin.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
@@ -24,6 +36,4 @@ ctrlc = "3"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-[dev-dependencies]
 tempfile = "3"

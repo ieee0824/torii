@@ -1,8 +1,9 @@
 use dialoguer::{Confirm, Input, Password, Select};
 
+use crate::commands::{cmd_delete, cmd_get, cmd_list, cmd_serve, cmd_set};
 use crate::error::{EnvsGateError, Result};
 use crate::logger::Logger;
-use crate::{cmd_delete, cmd_get, cmd_list, cmd_serve, cmd_set, crypto, db};
+use crate::{crypto, db};
 
 fn io_err(e: dialoguer::Error) -> EnvsGateError {
     EnvsGateError::InvalidInput(format!("Prompt error: {e}"))
