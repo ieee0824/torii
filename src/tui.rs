@@ -221,10 +221,7 @@ fn interactive_merge(log: &mut Option<Logger>) -> Result<()> {
                 } else {
                     conflict_count += 1;
                     eprintln!("\nConflict: {key}");
-                    let choices = &[
-                        format!("[{ns_a}] {val_a}"),
-                        format!("[{ns_b}] {val_b}"),
-                    ];
+                    let choices = &[format!("[{ns_a}] {val_a}"), format!("[{ns_b}] {val_b}")];
                     let pick = Select::new()
                         .with_prompt(format!("Which value for '{key}'?"))
                         .items(choices)
@@ -252,11 +249,7 @@ fn interactive_merge(log: &mut Option<Logger>) -> Result<()> {
     }
 
     // 出力方式を選択
-    let output_modes = &[
-        "Print to stdout",
-        "Serve virtual .env",
-        "Execute command",
-    ];
+    let output_modes = &["Print to stdout", "Serve virtual .env", "Execute command"];
     let mode = Select::new()
         .with_prompt("Output")
         .items(output_modes)
@@ -308,9 +301,8 @@ fn interactive_merge(log: &mut Option<Logger>) -> Result<()> {
                 .interact_text()
                 .map_err(io_err)?;
 
-            let command: Vec<String> = shell_words::split(&cmd_str).map_err(|e| {
-                EnvsGateError::InvalidInput(format!("Invalid command: {e}"))
-            })?;
+            let command: Vec<String> = shell_words::split(&cmd_str)
+                .map_err(|e| EnvsGateError::InvalidInput(format!("Invalid command: {e}")))?;
 
             let code = exec_with_env(&command, merged, log)?;
             eprintln!("Exit code: {code}");
