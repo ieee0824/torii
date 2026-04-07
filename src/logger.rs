@@ -182,6 +182,11 @@ impl Logger {
         self.log(&LogEntry::new("rotate_dek", None, Some(&detail)));
     }
 
+    pub fn log_merge(&mut self, ns_a: &str, ns_b: &str, total: usize, conflicts: usize) {
+        let detail = format!("ns_a={ns_a}, ns_b={ns_b}, total={total}, conflicts={conflicts}");
+        self.log(&LogEntry::new("merge", None, Some(&detail)));
+    }
+
     pub fn log_auth_failed(&mut self) {
         self.log(&LogEntry::new("auth_failed", None, None));
     }
