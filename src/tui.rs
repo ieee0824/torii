@@ -4,8 +4,8 @@ use dialoguer::{Confirm, Input, Password, Select};
 use zeroize::Zeroize;
 
 use crate::commands::{
-    cmd_delete, cmd_get, cmd_list, cmd_serve, cmd_set, decrypt_all_vars, exec_with_env,
-    list_namespace_names, resolve_paths,
+    AuditEvent, CommandOutput, cmd_delete, cmd_get, cmd_list, cmd_serve, cmd_set, decrypt_all_vars,
+    exec_with_env, flush_events, list_namespace_names, resolve_paths,
 };
 use crate::error::{EnvsGateError, Result};
 use crate::fuse_fs;
@@ -61,7 +61,7 @@ pub fn run_interactive(db_path: &str, log_path: Option<&str>) -> Result<()> {
         let result = match choice {
             0 => interactive_set(db_path, &password, &mut log),
             1 => interactive_get(db_path, &password, &mut log),
-            2 => cmd_list(db_path, &password, &mut log),
+            2 => interactive_list(db_path, &password, &mut log),
             3 => interactive_delete(db_path, &password, &mut log),
             4 => interactive_serve(db_path, &password, &mut log),
             5 => interactive_merge(&mut log),
@@ -106,8 +106,17 @@ fn interactive_set(db_path: &str, password: &str, log: &mut Option<Logger>) -> R
         None
     };
 
+    let conn = db::open_or_create_db(db_path)?;
     let key_value = format!("{key}={value}");
-    cmd_set(db_path, password, &key_value, expires.as_deref(), log)
+    let output = cmd_set(&conn, password, &key_value, expires.as_deref())?;
+    flush_events(&output.events, log);
+
+    if let Some(ref exp) = output.value.expires {
+        eprintln!("Set: {} (expires: {exp})", output.value.key);
+    } else {
+        eprintln!("Set: {}", output.value.key);
+    }
+    Ok(())
 }
 
 fn interactive_get(db_path: &str, password: &str, log: &mut Option<Logger>) -> Result<()> {
@@ -116,7 +125,39 @@ fn interactive_get(db_path: &str, password: &str, log: &mut Option<Logger>) -> R
         .interact_text()
         .map_err(io_err)?;
 
-    cmd_get(db_path, password, &key, log)
+    let conn = db::open_or_create_db(db_path)?;
+    let output = cmd_get(&conn, password, &key)?;
+    flush_events(&output.events, log);
+    let mut value = output.value;
+    println!("{value}");
+    value.zeroize();
+    Ok(())
+}
+
+fn interactive_list(db_path: &str, password: &str, log: &mut Option<Logger>) -> Result<()> {
+    let conn = db::open_or_create_db(db_path)?;
+    let output = cmd_list(&conn, password)?;
+    flush_events(&output.events, log);
+
+    for entry in &output.value {
+        if entry.expired {
+            println!(
+                "{}={} [EXPIRED: {}]",
+                entry.key,
+                entry.value,
+                entry.expires_at.as_deref().unwrap()
+            );
+        } else if let Some(ref exp) = entry.expires_at {
+            println!("{}={} [expires: {}]", entry.key, entry.value, exp);
+        } else {
+            println!("{}={}", entry.key, entry.value);
+        }
+    }
+
+    for mut entry in output.value {
+        entry.value.zeroize();
+    }
+    Ok(())
 }
 
 fn interactive_delete(db_path: &str, password: &str, log: &mut Option<Logger>) -> Result<()> {
@@ -132,7 +173,11 @@ fn interactive_delete(db_path: &str, password: &str, log: &mut Option<Logger>) -
         .map_err(io_err)?;
 
     if confirmed {
-        cmd_delete(db_path, password, &key, log)
+        let conn = db::open_or_create_db(db_path)?;
+        let output = cmd_delete(&conn, password, &key)?;
+        flush_events(&output.events, log);
+        eprintln!("Deleted: {key}");
+        Ok(())
     } else {
         eprintln!("Cancelled.");
         Ok(())
@@ -187,8 +232,10 @@ fn interactive_merge(log: &mut Option<Logger>) -> Result<()> {
         .map_err(io_err)?;
 
     // 両方の環境変数を復号
-    let vars_a = decrypt_all_vars(&db_a, &pw_a, log)?;
-    let vars_b = decrypt_all_vars(&db_b, &pw_b, log)?;
+    let conn_a = db::open_or_create_db(&db_a)?;
+    let conn_b = db::open_or_create_db(&db_b)?;
+    let vars_a = decrypt_all_vars(&conn_a, &pw_a)?;
+    let vars_b = decrypt_all_vars(&conn_b, &pw_b)?;
 
     // マージ: BTreeMap で管理（キー順ソート）
     let map_a: BTreeMap<&str, (&str, Option<&str>)> = vars_a
@@ -244,9 +291,15 @@ fn interactive_merge(log: &mut Option<Logger>) -> Result<()> {
         conflict_count,
     );
 
-    if let Some(l) = log {
-        l.log_merge(ns_a, ns_b, merged.len(), conflict_count);
-    }
+    flush_events(
+        &[AuditEvent::Merge {
+            ns_a: ns_a.clone(),
+            ns_b: ns_b.clone(),
+            total: merged.len(),
+            conflicts: conflict_count,
+        }],
+        log,
+    );
 
     // 出力方式を選択
     let output_modes = &["Print to stdout", "Serve virtual .env", "Execute command"];
@@ -304,8 +357,9 @@ fn interactive_merge(log: &mut Option<Logger>) -> Result<()> {
             let command: Vec<String> = shell_words::split(&cmd_str)
                 .map_err(|e| EnvsGateError::InvalidInput(format!("Invalid command: {e}")))?;
 
-            let code = exec_with_env(&command, merged, log)?;
-            eprintln!("Exit code: {code}");
+            let output: CommandOutput<i32> = exec_with_env(&command, merged)?;
+            flush_events(&output.events, log);
+            eprintln!("Exit code: {}", output.value);
         }
         _ => unreachable!(),
     }
@@ -326,5 +380,8 @@ fn interactive_serve(db_path: &str, password: &str, log: &mut Option<Logger>) ->
         .interact()
         .map_err(io_err)?;
 
-    cmd_serve(db_path, password, &env_path, once, None, log)
+    let conn = db::open_or_create_db(db_path)?;
+    let output = cmd_serve(&conn, db_path, password, &env_path, once, None)?;
+    flush_events(&output.events, log);
+    Ok(())
 }

@@ -1,33 +1,25 @@
 use std::io::Write;
 use std::path::Path;
 
-use crate::crypto;
+use crate::commands;
 use crate::db;
 use crate::error::{EnvsGateError, Result};
 
 fn generate_env_content(db_path: &str, dek: &[u8; 32]) -> Result<Vec<u8>> {
-    let conn = rusqlite::Connection::open(db_path)?;
-    let vars = db::list_env_vars(&conn)?;
-    let now = chrono::Local::now().naive_local();
+    let conn = db::open_or_create_db(db_path)?;
+    let vars = commands::decrypt_all_env_vars(&conn, dek)?;
+
     let mut content = String::new();
-
     for var in &vars {
-        if let Some(ref exp) = var.expires_at {
-            let expired = chrono::NaiveDateTime::parse_from_str(exp, "%Y-%m-%dT%H:%M:%S")
-                .map(|dt| now > dt)
-                .or_else(|_| {
-                    chrono::NaiveDate::parse_from_str(exp, "%Y-%m-%d").map(|d| now.date() > d)
-                })
-                .unwrap_or(false);
-            if expired {
-                eprintln!("Warning: {} expired at {}", var.key_name, exp);
-                continue;
-            }
+        if var.expired {
+            eprintln!(
+                "Warning: {} expired at {}",
+                var.key,
+                var.expires_at.as_deref().unwrap_or("unknown")
+            );
+            continue;
         }
-
-        let plaintext = crypto::decrypt_value(dek, &var.nonce, &var.ciphertext)?;
-        let value = String::from_utf8_lossy(&plaintext);
-        content.push_str(&format!("{}={}\n", var.key_name, value));
+        content.push_str(&format!("{}={}\n", var.key, var.value));
     }
 
     Ok(content.into_bytes())

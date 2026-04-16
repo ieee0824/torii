@@ -1,7 +1,137 @@
 use chrono::Local;
+use rusqlite::Connection;
 use zeroize::Zeroize;
 
 use crate::{crypto, db, error, fuse_fs, logger};
+
+// ---------------------------------------------------------------------------
+// 参照透過性のための型定義
+// ---------------------------------------------------------------------------
+
+/// コマンドが生成する監査イベント（データとして返し、呼び出し元が Logger に書き込む）
+#[derive(Debug, Clone)]
+pub enum AuditEvent {
+    Set {
+        key: String,
+        expires: Option<String>,
+    },
+    Get {
+        key: String,
+    },
+    List,
+    Delete {
+        key: String,
+    },
+    Serve {
+        env_path: String,
+        once: bool,
+        timeout: Option<u64>,
+    },
+    Exec {
+        command: String,
+        keys_injected: usize,
+    },
+    RotatePassword,
+    RotateDek {
+        reencrypted: usize,
+    },
+    Merge {
+        ns_a: String,
+        ns_b: String,
+        total: usize,
+        conflicts: usize,
+    },
+    AuthFailed,
+    Expired {
+        key: String,
+    },
+}
+
+/// 純粋なコマンド出力: 計算結果 + 監査イベント
+pub struct CommandOutput<T> {
+    pub value: T,
+    pub events: Vec<AuditEvent>,
+}
+
+impl<T> CommandOutput<T> {
+    pub fn new(value: T) -> Self {
+        Self {
+            value,
+            events: Vec::new(),
+        }
+    }
+
+    pub fn with_event(mut self, event: AuditEvent) -> Self {
+        self.events.push(event);
+        self
+    }
+}
+
+/// `cmd_set` の結果
+pub struct SetResult {
+    pub key: String,
+    pub expires: Option<String>,
+}
+
+/// `cmd_list` の各エントリ
+pub struct ListEntry {
+    pub key: String,
+    pub value: String,
+    pub expires_at: Option<String>,
+    pub expired: bool,
+}
+
+/// 復号済み環境変数（共通型）
+pub struct DecryptedVar {
+    pub key: String,
+    pub value: String,
+    pub expires_at: Option<String>,
+    pub expired: bool,
+}
+
+/// AuditEvent を Logger に書き込む
+pub fn flush_events(events: &[AuditEvent], log: &mut Option<logger::Logger>) {
+    if let Some(l) = log {
+        for event in events {
+            match event {
+                AuditEvent::Set { key, expires } => l.log_set(key, expires.as_deref()),
+                AuditEvent::Get { key } => l.log_get(key),
+                AuditEvent::List => l.log_list(),
+                AuditEvent::Delete { key } => l.log_delete(key),
+                AuditEvent::Serve {
+                    env_path,
+                    once,
+                    timeout,
+                } => l.log_serve(env_path, *once, *timeout),
+                AuditEvent::Exec {
+                    command,
+                    keys_injected,
+                } => l.log_exec(command, *keys_injected),
+                AuditEvent::RotatePassword => l.log_rotate_password(),
+                AuditEvent::RotateDek { reencrypted } => l.log_rotate_dek(*reencrypted),
+                AuditEvent::Merge {
+                    ns_a,
+                    ns_b,
+                    total,
+                    conflicts,
+                } => l.log_merge(ns_a, ns_b, *total, *conflicts),
+                AuditEvent::AuthFailed => l.log_auth_failed(),
+                AuditEvent::Expired { key } => l.log_expired(key),
+            }
+        }
+    }
+}
+
+/// エラー型から監査イベントを抽出して Logger に書き込む
+pub fn flush_error_events(e: &error::EnvsGateError, log: &mut Option<logger::Logger>) {
+    if let Some(l) = log {
+        match e {
+            error::EnvsGateError::AuthenticationFailed => l.log_auth_failed(),
+            error::EnvsGateError::KeyExpired { key, .. } => l.log_expired(key),
+            _ => {}
+        }
+    }
+}
 
 pub fn validate_namespace(ns: &str) -> error::Result<()> {
     if ns.is_empty() || ns == "." || ns == ".." {
@@ -103,21 +233,34 @@ pub fn resolve_paths(
     Ok((db, log))
 }
 
-/// Unwrap DEK with auth failure logging
-pub fn unwrap_dek_logged(
-    password: &str,
-    meta: &db::VaultMetadata,
-    log: &mut Option<logger::Logger>,
-) -> error::Result<[u8; 32]> {
-    match crypto::unwrap_dek(password, meta) {
-        Ok(dek) => Ok(dek),
-        Err(e) => {
-            if let Some(l) = log {
-                l.log_auth_failed();
-            }
-            Err(e)
-        }
+/// 全環境変数を復号して返す。期限切れは `expired` フラグで示すだけで、
+/// スキップやエラーにはしない（ポリシーは呼び出し元が決める）。
+pub fn decrypt_all_env_vars(conn: &Connection, dek: &[u8; 32]) -> error::Result<Vec<DecryptedVar>> {
+    let vars = db::list_env_vars(conn)?;
+    let mut result = Vec::with_capacity(vars.len());
+
+    for var in &vars {
+        let expired = var.expires_at.as_ref().is_some_and(|exp| is_expired(exp));
+
+        let plaintext = crypto::decrypt_value(dek, &var.nonce, &var.ciphertext)?;
+        let value = String::from_utf8(plaintext).map_err(|e| {
+            let mut bytes = e.into_bytes();
+            bytes.zeroize();
+            error::EnvsGateError::InvalidInput(format!(
+                "Value for '{}' contains invalid UTF-8",
+                var.key_name
+            ))
+        })?;
+
+        result.push(DecryptedVar {
+            key: var.key_name.clone(),
+            value,
+            expires_at: var.expires_at.clone(),
+            expired,
+        });
     }
+
+    Ok(result)
 }
 
 /// Parse an expiry string into an ISO 8601 datetime string.
@@ -178,12 +321,11 @@ pub fn is_expired(expires_at: &str) -> bool {
 }
 
 pub fn cmd_set(
-    db_path: &str,
+    conn: &Connection,
     password: &str,
     key_value: &str,
     expires: Option<&str>,
-    log: &mut Option<logger::Logger>,
-) -> error::Result<()> {
+) -> error::Result<CommandOutput<SetResult>> {
     let (key, value) = key_value
         .split_once('=')
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Expected KEY=VALUE format".into()))?;
@@ -193,166 +335,125 @@ pub fn cmd_set(
         None => None,
     };
 
-    let conn = db::open_or_create_db(db_path)?;
-
-    let dek = if db::is_initialized(&conn)? {
-        unwrap_dek_logged(password, &db::load_metadata(&conn)?.unwrap(), log)?
+    let dek = if db::is_initialized(conn)? {
+        crypto::unwrap_dek(password, &db::load_metadata(conn)?.unwrap())?
     } else {
         let (vault_meta, dek) = crypto::init_vault(password)?;
-        db::store_metadata(&conn, &vault_meta)?;
+        db::store_metadata(conn, &vault_meta)?;
         dek
     };
 
     let (nonce, ciphertext) = crypto::encrypt_value(&dek, value.as_bytes())?;
-    db::upsert_env_var(&conn, key, &nonce, &ciphertext, resolved_expires.as_deref())?;
+    db::upsert_env_var(conn, key, &nonce, &ciphertext, resolved_expires.as_deref())?;
 
-    if let Some(l) = log {
-        l.log_set(key, resolved_expires.as_deref());
-    }
-
-    if let Some(ref exp) = resolved_expires {
-        eprintln!("Set: {key} (expires: {exp})");
-    } else {
-        eprintln!("Set: {key}");
-    }
-    Ok(())
+    let result = SetResult {
+        key: key.to_string(),
+        expires: resolved_expires.clone(),
+    };
+    Ok(CommandOutput::new(result).with_event(AuditEvent::Set {
+        key: key.to_string(),
+        expires: resolved_expires,
+    }))
 }
 
 pub fn cmd_get(
-    db_path: &str,
+    conn: &Connection,
     password: &str,
     key: &str,
-    log: &mut Option<logger::Logger>,
-) -> error::Result<()> {
-    let conn = db::open_or_create_db(db_path)?;
-    let meta = db::load_metadata(&conn)?
+) -> error::Result<CommandOutput<String>> {
+    let meta = db::load_metadata(conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
-    let dek = unwrap_dek_logged(password, &meta, log)?;
+    let dek = crypto::unwrap_dek(password, &meta)?;
 
-    let var = db::get_env_var(&conn, key)?
-        .ok_or_else(|| error::EnvsGateError::KeyNotFound(key.into()))?;
+    let var =
+        db::get_env_var(conn, key)?.ok_or_else(|| error::EnvsGateError::KeyNotFound(key.into()))?;
 
     if let Some(ref exp) = var.expires_at
         && is_expired(exp)
     {
-        if let Some(l) = log {
-            l.log_expired(key);
-        }
         return Err(error::EnvsGateError::KeyExpired {
             key: key.into(),
             expired_at: exp.clone(),
         });
     }
 
-    if let Some(l) = log {
-        l.log_get(key);
-    }
-
     let mut plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
-    println!("{}", String::from_utf8_lossy(&plaintext));
+    let value = String::from_utf8_lossy(&plaintext).into_owned();
     plaintext.zeroize();
-    Ok(())
+
+    Ok(CommandOutput::new(value).with_event(AuditEvent::Get {
+        key: key.to_string(),
+    }))
 }
 
-pub fn cmd_list(
-    db_path: &str,
-    password: &str,
-    log: &mut Option<logger::Logger>,
-) -> error::Result<()> {
-    let conn = db::open_or_create_db(db_path)?;
-    let meta = db::load_metadata(&conn)?
+pub fn cmd_list(conn: &Connection, password: &str) -> error::Result<CommandOutput<Vec<ListEntry>>> {
+    let meta = db::load_metadata(conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
-    let dek = unwrap_dek_logged(password, &meta, log)?;
+    let dek = crypto::unwrap_dek(password, &meta)?;
 
-    let vars = db::list_env_vars(&conn)?;
+    let decrypted = decrypt_all_env_vars(conn, &dek)?;
+    let entries: Vec<ListEntry> = decrypted
+        .into_iter()
+        .map(|v| ListEntry {
+            key: v.key,
+            value: v.value,
+            expires_at: v.expires_at,
+            expired: v.expired,
+        })
+        .collect();
 
-    if let Some(l) = log {
-        l.log_list();
-    }
-
-    for var in &vars {
-        let expired = var.expires_at.as_ref().is_some_and(|exp| is_expired(exp));
-
-        let mut plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
-        let value = String::from_utf8_lossy(&plaintext);
-
-        if expired {
-            println!(
-                "{}={} [EXPIRED: {}]",
-                var.key_name,
-                value,
-                var.expires_at.as_deref().unwrap()
-            );
-        } else if let Some(ref exp) = var.expires_at {
-            println!("{}={} [expires: {}]", var.key_name, value, exp);
-        } else {
-            println!("{}={}", var.key_name, value);
-        }
-
-        drop(value);
-        plaintext.zeroize();
-    }
-
-    Ok(())
+    Ok(CommandOutput::new(entries).with_event(AuditEvent::List))
 }
 
 pub fn cmd_delete(
-    db_path: &str,
+    conn: &Connection,
     password: &str,
     key: &str,
-    log: &mut Option<logger::Logger>,
-) -> error::Result<()> {
-    let conn = db::open_or_create_db(db_path)?;
-    let meta = db::load_metadata(&conn)?
+) -> error::Result<CommandOutput<()>> {
+    let meta = db::load_metadata(conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
     // Verify password
-    let _dek = unwrap_dek_logged(password, &meta, log)?;
+    let _dek = crypto::unwrap_dek(password, &meta)?;
 
-    if db::delete_env_var(&conn, key)? {
-        if let Some(l) = log {
-            l.log_delete(key);
-        }
-        eprintln!("Deleted: {key}");
+    if db::delete_env_var(conn, key)? {
+        Ok(CommandOutput::new(()).with_event(AuditEvent::Delete {
+            key: key.to_string(),
+        }))
     } else {
-        return Err(error::EnvsGateError::KeyNotFound(key.into()));
+        Err(error::EnvsGateError::KeyNotFound(key.into()))
     }
-
-    Ok(())
 }
 
 pub fn cmd_serve(
+    conn: &Connection,
     db_path: &str,
     password: &str,
     env_path: &str,
     once: bool,
     timeout: Option<u64>,
-    log: &mut Option<logger::Logger>,
-) -> error::Result<()> {
-    let conn = db::open_or_create_db(db_path)?;
-    let meta = db::load_metadata(&conn)?
+) -> error::Result<CommandOutput<()>> {
+    let meta = db::load_metadata(conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
-    let dek = unwrap_dek_logged(password, &meta, log)?;
+    let dek = crypto::unwrap_dek(password, &meta)?;
 
-    let vars = db::list_env_vars(&conn)?;
-    for var in &vars {
-        if let Some(ref exp) = var.expires_at
-            && is_expired(exp)
-        {
-            if let Some(l) = log {
-                l.log_expired(&var.key_name);
-            }
-            return Err(error::EnvsGateError::KeyExpired {
-                key: var.key_name.clone(),
-                expired_at: exp.clone(),
-            });
-        }
+    let vars = decrypt_all_env_vars(conn, &dek)?;
+    if let Some(v) = vars.iter().find(|v| v.expired) {
+        return Err(error::EnvsGateError::KeyExpired {
+            key: v.key.clone(),
+            expired_at: v.expires_at.clone().unwrap_or_default(),
+        });
     }
 
-    if let Some(l) = log {
-        l.log_serve(env_path, once, timeout);
-    }
+    let events = vec![AuditEvent::Serve {
+        env_path: env_path.to_string(),
+        once,
+        timeout,
+    }];
 
-    fuse_fs::serve(db_path, &dek, env_path, once, timeout)
+    // serve は副作用だが、事前チェック後に実行
+    fuse_fs::serve(db_path, &dek, env_path, once, timeout)?;
+
+    Ok(CommandOutput { value: (), events })
 }
 
 static CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -379,59 +480,39 @@ fn install_signal_forwarder() {
 }
 
 pub fn cmd_exec(
-    db_path: &str,
+    conn: &Connection,
     password: &str,
     command: &[String],
-    log: &mut Option<logger::Logger>,
-) -> error::Result<i32> {
+) -> error::Result<CommandOutput<i32>> {
     if command.is_empty() {
         return Err(error::EnvsGateError::InvalidInput(
             "No command specified".into(),
         ));
     }
 
-    let conn = db::open_or_create_db(db_path)?;
-    let meta = db::load_metadata(&conn)?
+    let meta = db::load_metadata(conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
-    let dek = unwrap_dek_logged(password, &meta, log)?;
+    let dek = crypto::unwrap_dek(password, &meta)?;
 
-    let vars = db::list_env_vars(&conn)?;
-    let mut env_pairs = Vec::new();
-
-    for var in &vars {
-        if let Some(ref exp) = var.expires_at
-            && is_expired(exp)
-        {
-            if let Some(l) = log {
-                l.log_expired(&var.key_name);
-            }
-            return Err(error::EnvsGateError::KeyExpired {
-                key: var.key_name.clone(),
-                expired_at: exp.clone(),
-            });
-        }
-
-        let plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
-        let value = String::from_utf8(plaintext).map_err(|e| {
-            let mut bytes = e.into_bytes();
-            bytes.zeroize();
-            error::EnvsGateError::InvalidInput(format!(
-                "Value for '{}' contains invalid UTF-8",
-                var.key_name
-            ))
-        })?;
-        env_pairs.push((var.key_name.clone(), value));
+    let vars = decrypt_all_env_vars(conn, &dek)?;
+    if let Some(v) = vars.iter().find(|v| v.expired) {
+        return Err(error::EnvsGateError::KeyExpired {
+            key: v.key.clone(),
+            expired_at: v.expires_at.clone().unwrap_or_default(),
+        });
     }
 
-    if let Some(l) = log {
-        l.log_exec(&command[0], env_pairs.len());
-    }
+    let env_pairs: Vec<(String, String)> = vars.into_iter().map(|v| (v.key, v.value)).collect();
+
+    let keys_injected = env_pairs.len();
+    let events = vec![AuditEvent::Exec {
+        command: command[0].clone(),
+        keys_injected,
+    }];
 
     let program = &command[0];
     let args = &command[1..];
 
-    // Install signal handlers before spawn so no window exists
-    // where a signal could kill the parent without forwarding.
     install_signal_forwarder();
 
     // NOTE: On Linux, injected env vars are visible via /proc/<pid>/environ
@@ -456,9 +537,14 @@ pub fn cmd_exec(
     })?;
 
     use std::os::unix::process::ExitStatusExt;
-    Ok(status
+    let code = status
         .code()
-        .unwrap_or_else(|| status.signal().map_or(1, |sig| 128 + sig)))
+        .unwrap_or_else(|| status.signal().map_or(1, |sig| 128 + sig));
+
+    Ok(CommandOutput {
+        value: code,
+        events,
+    })
 }
 
 pub fn list_namespace_names() -> error::Result<Vec<String>> {
@@ -482,58 +568,37 @@ pub fn list_namespace_names() -> error::Result<Vec<String>> {
     Ok(entries)
 }
 
-pub fn cmd_namespaces() -> error::Result<()> {
-    let entries = list_namespace_names()?;
-
-    if entries.is_empty() {
-        eprintln!("No namespaces found.");
-    } else {
-        for ns in &entries {
-            if ns == "default" {
-                println!("{ns} (default)");
-            } else {
-                println!("{ns}");
-            }
-        }
-    }
-
-    Ok(())
+pub fn cmd_namespaces() -> error::Result<Vec<String>> {
+    list_namespace_names()
 }
 
 /// Decrypt all non-expired environment variables from a namespace DB.
 /// Returns Vec of (key, plaintext_value, expires_at).
 pub fn decrypt_all_vars(
-    db_path: &str,
+    conn: &Connection,
     password: &str,
-    log: &mut Option<logger::Logger>,
 ) -> error::Result<Vec<(String, String, Option<String>)>> {
-    let conn = db::open_or_create_db(db_path)?;
-    let meta = db::load_metadata(&conn)?
+    let meta = db::load_metadata(conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
-    let dek = unwrap_dek_logged(password, &meta, log)?;
+    let dek = crypto::unwrap_dek(password, &meta)?;
 
-    let vars = db::list_env_vars(&conn)?;
-    let mut result = Vec::new();
-
-    for var in &vars {
-        if let Some(ref exp) = var.expires_at
-            && is_expired(exp)
-        {
-            eprintln!("Warning: {} expired at {}, skipping", var.key_name, exp);
-            continue;
-        }
-
-        let plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
-        let value = String::from_utf8(plaintext).map_err(|e| {
-            let mut bytes = e.into_bytes();
-            bytes.zeroize();
-            error::EnvsGateError::InvalidInput(format!(
-                "Value for '{}' contains invalid UTF-8",
-                var.key_name
-            ))
-        })?;
-        result.push((var.key_name.clone(), value, var.expires_at.clone()));
-    }
+    let vars = decrypt_all_env_vars(conn, &dek)?;
+    let result = vars
+        .into_iter()
+        .filter(|v| {
+            if v.expired {
+                eprintln!(
+                    "Warning: {} expired at {}, skipping",
+                    v.key,
+                    v.expires_at.as_deref().unwrap_or("unknown")
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .map(|v| (v.key, v.value, v.expires_at))
+        .collect();
 
     Ok(result)
 }
@@ -542,17 +607,18 @@ pub fn decrypt_all_vars(
 pub fn exec_with_env(
     command: &[String],
     env_pairs: Vec<(String, String)>,
-    log: &mut Option<logger::Logger>,
-) -> error::Result<i32> {
+) -> error::Result<CommandOutput<i32>> {
     if command.is_empty() {
         return Err(error::EnvsGateError::InvalidInput(
             "No command specified".into(),
         ));
     }
 
-    if let Some(l) = log {
-        l.log_exec(&command[0], env_pairs.len());
-    }
+    let keys_injected = env_pairs.len();
+    let events = vec![AuditEvent::Exec {
+        command: command[0].clone(),
+        keys_injected,
+    }];
 
     let program = &command[0];
     let args = &command[1..];
@@ -578,45 +644,41 @@ pub fn exec_with_env(
     })?;
 
     use std::os::unix::process::ExitStatusExt;
-    Ok(status
+    let code = status
         .code()
-        .unwrap_or_else(|| status.signal().map_or(1, |sig| 128 + sig)))
+        .unwrap_or_else(|| status.signal().map_or(1, |sig| 128 + sig));
+
+    Ok(CommandOutput {
+        value: code,
+        events,
+    })
 }
 
 pub fn cmd_rotate_password(
-    db_path: &str,
+    conn: &Connection,
     old_password: &str,
     new_password: &str,
-    log: &mut Option<logger::Logger>,
-) -> error::Result<()> {
-    let conn = db::open_or_create_db(db_path)?;
-    let meta = db::load_metadata(&conn)?
+) -> error::Result<CommandOutput<()>> {
+    let meta = db::load_metadata(conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
 
-    let mut dek = unwrap_dek_logged(old_password, &meta, log)?;
+    let mut dek = crypto::unwrap_dek(old_password, &meta)?;
     let new_meta = crypto::wrap_dek(new_password, &dek)?;
     dek.zeroize();
 
-    db::update_metadata(&conn, &new_meta)?;
+    db::update_metadata(conn, &new_meta)?;
 
-    if let Some(l) = log {
-        l.log_rotate_password();
-    }
-
-    eprintln!("Password rotated successfully");
-    Ok(())
+    Ok(CommandOutput::new(()).with_event(AuditEvent::RotatePassword))
 }
 
 pub fn cmd_rotate_dek(
-    db_path: &str,
+    conn: &mut Connection,
     password: &str,
-    log: &mut Option<logger::Logger>,
-) -> error::Result<()> {
-    let mut conn = db::open_or_create_db(db_path)?;
-    let meta = db::load_metadata(&conn)?
+) -> error::Result<CommandOutput<usize>> {
+    let meta = db::load_metadata(conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
 
-    let mut old_dek = unwrap_dek_logged(password, &meta, log)?;
+    let mut old_dek = crypto::unwrap_dek(password, &meta)?;
 
     // IMMEDIATE transaction to prevent concurrent writes during rotation
     let tx = conn
@@ -650,17 +712,10 @@ pub fn cmd_rotate_dek(
     new_dek.zeroize();
     drop(decrypted);
 
+    let reencrypted = vars.len();
     tx.commit().map_err(error::EnvsGateError::Db)?;
 
-    if let Some(l) = log {
-        l.log_rotate_dek(vars.len());
-    }
-
-    eprintln!(
-        "DEK rotated successfully ({} values re-encrypted)",
-        vars.len()
-    );
-    Ok(())
+    Ok(CommandOutput::new(reencrypted).with_event(AuditEvent::RotateDek { reencrypted }))
 }
 
 #[cfg(test)]
@@ -771,6 +826,12 @@ mod tests {
         assert!(!is_expired(""));
     }
 
+    // --- テストヘルパー ---
+
+    fn test_conn(db_path: &str) -> Connection {
+        db::open_or_create_db(db_path).unwrap()
+    }
+
     // --- 統合テスト ---
 
     #[test]
@@ -779,16 +840,16 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "MY_KEY=my_value", None, &mut None).unwrap();
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "MY_KEY=my_value", None).unwrap();
 
-        let conn = db::open_or_create_db(db_path).unwrap();
         let meta = db::load_metadata(&conn).unwrap().unwrap();
         let dek = crypto::unwrap_dek("pw", &meta).unwrap();
         let var = db::get_env_var(&conn, "MY_KEY").unwrap().unwrap();
         let plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext).unwrap();
         assert_eq!(plaintext, b"my_value");
 
-        cmd_delete(db_path, "pw", "MY_KEY", &mut None).unwrap();
+        cmd_delete(&conn, "pw", "MY_KEY").unwrap();
         assert!(db::get_env_var(&conn, "MY_KEY").unwrap().is_none());
     }
 
@@ -798,8 +859,9 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "correct", "K=V", None, &mut None).unwrap();
-        let result = cmd_set(db_path, "wrong", "K2=V2", None, &mut None);
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "correct", "K=V", None).unwrap();
+        let result = cmd_set(&conn, "wrong", "K2=V2", None);
         assert!(result.is_err());
     }
 
@@ -809,8 +871,9 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "EXISTS=yes", None, &mut None).unwrap();
-        let result = cmd_get(db_path, "pw", "NOPE", &mut None);
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "EXISTS=yes", None).unwrap();
+        let result = cmd_get(&conn, "pw", "NOPE");
         assert!(result.is_err());
     }
 
@@ -820,8 +883,9 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "OLD=val", Some("2000-01-01"), &mut None).unwrap();
-        let result = cmd_get(db_path, "pw", "OLD", &mut None);
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "OLD=val", Some("2000-01-01")).unwrap();
+        let result = cmd_get(&conn, "pw", "OLD");
         assert!(result.is_err());
     }
 
@@ -831,8 +895,9 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
-        let result = cmd_delete(db_path, "pw", "MISSING", &mut None);
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "K=V", None).unwrap();
+        let result = cmd_delete(&conn, "pw", "MISSING");
         assert!(result.is_err());
     }
 
@@ -842,7 +907,8 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        let result = cmd_set(db_path, "pw", "NO_EQUALS_SIGN", None, &mut None);
+        let conn = test_conn(db_path);
+        let result = cmd_set(&conn, "pw", "NO_EQUALS_SIGN", None);
         assert!(result.is_err());
     }
 
@@ -852,16 +918,16 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "K=V", Some("1h"), &mut None).unwrap();
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "K=V", Some("1h")).unwrap();
 
-        let conn = db::open_or_create_db(db_path).unwrap();
         let var = db::get_env_var(&conn, "K").unwrap().unwrap();
         assert!(var.expires_at.is_some());
         let exp = var.expires_at.unwrap();
         chrono::NaiveDateTime::parse_from_str(&exp, "%Y-%m-%dT%H:%M:%S").unwrap();
     }
 
-    // --- ロガー統合テスト ---
+    // --- ロガー統合テスト (flush_events 経由) ---
 
     #[test]
     fn commands_write_audit_log() {
@@ -872,11 +938,16 @@ mod tests {
         let log_path_str = log_path.to_str().unwrap();
 
         let mut log = Some(logger::Logger::open(log_path_str).unwrap());
+        let conn = test_conn(db_path);
 
-        cmd_set(db_path, "pw", "K=V", None, &mut log).unwrap();
-        cmd_get(db_path, "pw", "K", &mut log).unwrap();
-        cmd_list(db_path, "pw", &mut log).unwrap();
-        cmd_delete(db_path, "pw", "K", &mut log).unwrap();
+        let out = cmd_set(&conn, "pw", "K=V", None).unwrap();
+        flush_events(&out.events, &mut log);
+        let out = cmd_get(&conn, "pw", "K").unwrap();
+        flush_events(&out.events, &mut log);
+        let out = cmd_list(&conn, "pw").unwrap();
+        flush_events(&out.events, &mut log);
+        let out = cmd_delete(&conn, "pw", "K").unwrap();
+        flush_events(&out.events, &mut log);
 
         drop(log);
 
@@ -899,8 +970,9 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
-        let result = cmd_exec(db_path, "pw", &[], &mut None);
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "K=V", None).unwrap();
+        let result = cmd_exec(&conn, "pw", &[]);
         assert!(result.is_err());
     }
 
@@ -910,13 +982,9 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
-        let result = cmd_exec(
-            db_path,
-            "wrong",
-            &["echo".into(), "hello".into()],
-            &mut None,
-        );
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "K=V", None).unwrap();
+        let result = cmd_exec(&conn, "wrong", &["echo".into(), "hello".into()]);
         assert!(result.is_err());
     }
 
@@ -926,8 +994,9 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "OLD=val", Some("2000-01-01"), &mut None).unwrap();
-        let result = cmd_exec(db_path, "pw", &["echo".into()], &mut None);
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "OLD=val", Some("2000-01-01")).unwrap();
+        let result = cmd_exec(&conn, "pw", &["echo".into()]);
         assert!(result.is_err());
     }
 
@@ -937,7 +1006,8 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        let result = cmd_exec(db_path, "pw", &["echo".into()], &mut None);
+        let conn = test_conn(db_path);
+        let result = cmd_exec(&conn, "pw", &["echo".into()]);
         assert!(result.is_err());
     }
 
@@ -948,15 +1018,16 @@ mod tests {
         let db_path = db_path.to_str().unwrap();
         let out_file = dir.path().join("out.txt");
 
-        cmd_set(db_path, "pw", "TORII_TEST_VAR=hello123", None, &mut None).unwrap();
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "TORII_TEST_VAR=hello123", None).unwrap();
 
         let cmd = vec![
             "sh".into(),
             "-c".into(),
             format!("echo $TORII_TEST_VAR > {}", out_file.display()),
         ];
-        let code = cmd_exec(db_path, "pw", &cmd, &mut None).unwrap();
-        assert_eq!(code, 0);
+        let output = cmd_exec(&conn, "pw", &cmd).unwrap();
+        assert_eq!(output.value, 0);
 
         let content = std::fs::read_to_string(&out_file).unwrap();
         assert_eq!(content.trim(), "hello123");
@@ -968,11 +1039,12 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "K=V", None).unwrap();
 
         let cmd = vec!["sh".into(), "-c".into(), "exit 42".into()];
-        let code = cmd_exec(db_path, "pw", &cmd, &mut None).unwrap();
-        assert_eq!(code, 42);
+        let output = cmd_exec(&conn, "pw", &cmd).unwrap();
+        assert_eq!(output.value, 42);
     }
 
     #[test]
@@ -981,12 +1053,13 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "K=V", None).unwrap();
 
         // Child sends SIGKILL to itself → exit code should be 128 + 9 = 137
         let cmd = vec!["sh".into(), "-c".into(), "kill -9 $$".into()];
-        let code = cmd_exec(db_path, "pw", &cmd, &mut None).unwrap();
-        assert_eq!(code, 137);
+        let output = cmd_exec(&conn, "pw", &cmd).unwrap();
+        assert_eq!(output.value, 137);
     }
 
     // --- rotate-password テスト ---
@@ -1006,17 +1079,16 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "old_pw", "SECRET=hello", None, &mut None).unwrap();
-
-        cmd_rotate_password(db_path, "old_pw", "new_pw", &mut None).unwrap();
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "old_pw", "DATA=hello", None).unwrap();
+        cmd_rotate_password(&conn, "old_pw", "new_pw").unwrap();
 
         // Old password should fail
-        let conn = db::open_or_create_db(db_path).unwrap();
         let meta = db::load_metadata(&conn).unwrap().unwrap();
         assert!(crypto::unwrap_dek("old_pw", &meta).is_err());
 
         // New password should work
-        assert_eq!(decrypt_var(db_path, "new_pw", "SECRET"), "hello");
+        assert_eq!(decrypt_var(db_path, "new_pw", "DATA"), "hello");
     }
 
     #[test]
@@ -1025,9 +1097,10 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "K=V", None).unwrap();
 
-        let result = cmd_rotate_password(db_path, "wrong", "new_pw", &mut None);
+        let result = cmd_rotate_password(&conn, "wrong", "new_pw");
         assert!(result.is_err());
 
         // Original password should still work
@@ -1040,7 +1113,8 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        let result = cmd_rotate_password(db_path, "old", "new", &mut None);
+        let conn = test_conn(db_path);
+        let result = cmd_rotate_password(&conn, "old", "new");
         assert!(result.is_err());
     }
 
@@ -1050,11 +1124,11 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "A=1", None, &mut None).unwrap();
-        cmd_set(db_path, "pw", "B=2", None, &mut None).unwrap();
-        cmd_set(db_path, "pw", "C=3", Some("2099-12-31"), &mut None).unwrap();
-
-        cmd_rotate_password(db_path, "pw", "new_pw", &mut None).unwrap();
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "A=1", None).unwrap();
+        cmd_set(&conn, "pw", "B=2", None).unwrap();
+        cmd_set(&conn, "pw", "C=3", Some("2099-12-31")).unwrap();
+        cmd_rotate_password(&conn, "pw", "new_pw").unwrap();
 
         assert_eq!(decrypt_var(db_path, "new_pw", "A"), "1");
         assert_eq!(decrypt_var(db_path, "new_pw", "B"), "2");
@@ -1068,10 +1142,12 @@ mod tests {
         let db_path = db_path.to_str().unwrap();
         let log_path = dir.path().join("audit.log");
 
-        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "K=V", None).unwrap();
 
         let mut log = Some(logger::Logger::open(log_path.to_str().unwrap()).unwrap());
-        cmd_rotate_password(db_path, "pw", "new_pw", &mut log).unwrap();
+        let out = cmd_rotate_password(&conn, "pw", "new_pw").unwrap();
+        flush_events(&out.events, &mut log);
         drop(log);
 
         let content = std::fs::read_to_string(&log_path).unwrap();
@@ -1088,23 +1164,23 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "SECRET=hello", None, &mut None).unwrap();
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "DATA=hello", None).unwrap();
 
         // Save old ciphertext
-        let conn = db::open_or_create_db(db_path).unwrap();
-        let old_var = db::get_env_var(&conn, "SECRET").unwrap().unwrap();
+        let old_var = db::get_env_var(&conn, "DATA").unwrap().unwrap();
         let old_ciphertext = old_var.ciphertext.clone();
         let old_nonce = old_var.nonce.clone();
         drop(conn);
 
-        cmd_rotate_dek(db_path, "pw", &mut None).unwrap();
+        let mut conn = db::open_or_create_db(db_path).unwrap();
+        cmd_rotate_dek(&mut conn, "pw").unwrap();
 
         // Value should still be readable
-        assert_eq!(decrypt_var(db_path, "pw", "SECRET"), "hello");
+        assert_eq!(decrypt_var(db_path, "pw", "DATA"), "hello");
 
         // Ciphertext should have changed (new DEK + new nonce)
-        let conn = db::open_or_create_db(db_path).unwrap();
-        let new_var = db::get_env_var(&conn, "SECRET").unwrap().unwrap();
+        let new_var = db::get_env_var(&conn, "DATA").unwrap().unwrap();
         assert_ne!(new_var.ciphertext, old_ciphertext);
         assert_ne!(new_var.nonce, old_nonce);
     }
@@ -1115,9 +1191,12 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "K=V", None).unwrap();
+        drop(conn);
 
-        let result = cmd_rotate_dek(db_path, "wrong", &mut None);
+        let mut conn = db::open_or_create_db(db_path).unwrap();
+        let result = cmd_rotate_dek(&mut conn, "wrong");
         assert!(result.is_err());
 
         // Original should still work
@@ -1130,7 +1209,8 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        let result = cmd_rotate_dek(db_path, "pw", &mut None);
+        let mut conn = db::open_or_create_db(db_path).unwrap();
+        let result = cmd_rotate_dek(&mut conn, "pw");
         assert!(result.is_err());
     }
 
@@ -1140,11 +1220,13 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        cmd_set(db_path, "pw", "K=V", Some("2099-12-31"), &mut None).unwrap();
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "K=V", Some("2099-12-31")).unwrap();
+        drop(conn);
 
-        cmd_rotate_dek(db_path, "pw", &mut None).unwrap();
+        let mut conn = db::open_or_create_db(db_path).unwrap();
+        cmd_rotate_dek(&mut conn, "pw").unwrap();
 
-        let conn = db::open_or_create_db(db_path).unwrap();
         let var = db::get_env_var(&conn, "K").unwrap().unwrap();
         assert!(var.expires_at.unwrap().starts_with("2099-12-31"));
     }
@@ -1155,11 +1237,13 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_path = db_path.to_str().unwrap();
 
-        // Initialize DB with no env vars
-        cmd_set(db_path, "pw", "K=V", None, &mut None).unwrap();
-        cmd_delete(db_path, "pw", "K", &mut None).unwrap();
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "K=V", None).unwrap();
+        cmd_delete(&conn, "pw", "K").unwrap();
+        drop(conn);
 
-        cmd_rotate_dek(db_path, "pw", &mut None).unwrap();
+        let mut conn = db::open_or_create_db(db_path).unwrap();
+        cmd_rotate_dek(&mut conn, "pw").unwrap();
     }
 
     #[test]
@@ -1169,11 +1253,15 @@ mod tests {
         let db_path = db_path.to_str().unwrap();
         let log_path = dir.path().join("audit.log");
 
-        cmd_set(db_path, "pw", "A=1", None, &mut None).unwrap();
-        cmd_set(db_path, "pw", "B=2", None, &mut None).unwrap();
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "A=1", None).unwrap();
+        cmd_set(&conn, "pw", "B=2", None).unwrap();
+        drop(conn);
 
         let mut log = Some(logger::Logger::open(log_path.to_str().unwrap()).unwrap());
-        cmd_rotate_dek(db_path, "pw", &mut log).unwrap();
+        let mut conn = db::open_or_create_db(db_path).unwrap();
+        let out = cmd_rotate_dek(&mut conn, "pw").unwrap();
+        flush_events(&out.events, &mut log);
         drop(log);
 
         let content = std::fs::read_to_string(&log_path).unwrap();
@@ -1317,12 +1405,14 @@ mod tests {
         let db_path = db_path.to_str().unwrap();
         let log_path = dir.path().join("audit.log");
 
-        cmd_set(db_path, "pw", "A=1", None, &mut None).unwrap();
-        cmd_set(db_path, "pw", "B=2", None, &mut None).unwrap();
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "A=1", None).unwrap();
+        cmd_set(&conn, "pw", "B=2", None).unwrap();
 
         let mut log = Some(logger::Logger::open(log_path.to_str().unwrap()).unwrap());
         let cmd = vec!["true".into()];
-        cmd_exec(db_path, "pw", &cmd, &mut log).unwrap();
+        let out = cmd_exec(&conn, "pw", &cmd).unwrap();
+        flush_events(&out.events, &mut log);
         drop(log);
 
         let content = std::fs::read_to_string(&log_path).unwrap();
@@ -1330,5 +1420,69 @@ mod tests {
             serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert_eq!(entry.action, "exec");
         assert!(entry.detail.unwrap().contains("keys_injected=2"));
+    }
+
+    // --- CommandOutput テスト ---
+
+    #[test]
+    fn command_output_with_event() {
+        let out = CommandOutput::new(42).with_event(AuditEvent::Get {
+            key: "K".to_string(),
+        });
+        assert_eq!(out.value, 42);
+        assert_eq!(out.events.len(), 1);
+    }
+
+    #[test]
+    fn cmd_get_returns_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "KEY=secret_value", None).unwrap();
+        let out = cmd_get(&conn, "pw", "KEY").unwrap();
+        assert_eq!(out.value, "secret_value");
+        assert_eq!(out.events.len(), 1);
+    }
+
+    #[test]
+    fn cmd_list_returns_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "A=1", None).unwrap();
+        cmd_set(&conn, "pw", "B=2", Some("2099-12-31")).unwrap();
+
+        let out = cmd_list(&conn, "pw").unwrap();
+        assert_eq!(out.value.len(), 2);
+        assert_eq!(out.value[0].key, "A");
+        assert_eq!(out.value[0].value, "1");
+        assert!(!out.value[0].expired);
+        assert_eq!(out.value[1].key, "B");
+        assert!(out.value[1].expires_at.is_some());
+    }
+
+    #[test]
+    fn decrypt_all_env_vars_marks_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_path = db_path.to_str().unwrap();
+
+        let conn = test_conn(db_path);
+        cmd_set(&conn, "pw", "LIVE=val", None).unwrap();
+        cmd_set(&conn, "pw", "OLD=val", Some("2000-01-01")).unwrap();
+
+        let meta = db::load_metadata(&conn).unwrap().unwrap();
+        let dek = crypto::unwrap_dek("pw", &meta).unwrap();
+        let vars = decrypt_all_env_vars(&conn, &dek).unwrap();
+
+        assert_eq!(vars.len(), 2);
+        let live = vars.iter().find(|v| v.key == "LIVE").unwrap();
+        let old = vars.iter().find(|v| v.key == "OLD").unwrap();
+        assert!(!live.expired);
+        assert!(old.expired);
     }
 }

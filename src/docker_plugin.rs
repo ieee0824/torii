@@ -5,7 +5,7 @@ use std::process::Command;
 use clap::{Parser, Subcommand};
 use zeroize::Zeroize;
 
-use torii::commands::{is_expired, resolve_paths, unwrap_dek_logged};
+use torii::commands::{decrypt_all_env_vars, resolve_paths};
 use torii::{crypto, db, error, logger};
 
 const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -64,41 +64,26 @@ fn validate_env_path(env_path: &str) -> error::Result<()> {
     Ok(())
 }
 
-fn decrypt_env_content(
-    db_path: &str,
-    password: &str,
-    log: &mut Option<logger::Logger>,
-) -> error::Result<String> {
+fn decrypt_env_content(db_path: &str, password: &str) -> error::Result<String> {
     let conn = db::open_or_create_db(db_path)?;
     let meta = db::load_metadata(&conn)?
         .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
-    let dek = unwrap_dek_logged(password, &meta, log)?;
+    let dek = crypto::unwrap_dek(password, &meta)?;
 
-    let vars = db::list_env_vars(&conn)?;
+    let vars = decrypt_all_env_vars(&conn, &dek)?;
+    if let Some(v) = vars.iter().find(|v| v.expired) {
+        return Err(error::EnvsGateError::KeyExpired {
+            key: v.key.clone(),
+            expired_at: v.expires_at.clone().unwrap_or_default(),
+        });
+    }
+
     let mut content = String::new();
-
     for var in &vars {
-        if let Some(ref exp) = var.expires_at
-            && is_expired(exp)
-        {
-            return Err(error::EnvsGateError::KeyExpired {
-                key: var.key_name.clone(),
-                expired_at: exp.clone(),
-            });
-        }
-
-        let mut plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
-        let value = std::str::from_utf8(&plaintext).map_err(|_| {
-            error::EnvsGateError::InvalidInput(format!(
-                "Value for '{}' contains invalid UTF-8",
-                var.key_name
-            ))
-        })?;
-        content.push_str(&var.key_name);
+        content.push_str(&var.key);
         content.push('=');
-        content.push_str(value);
+        content.push_str(&var.value);
         content.push('\n');
-        plaintext.zeroize();
     }
 
     Ok(content)
@@ -193,7 +178,7 @@ fn run(
     validate_env_path(env_path)?;
 
     let (db_path, log_path) = resolve_paths(db_path_opt, namespace, &None)?;
-    let mut log = match logger::Logger::open(&log_path) {
+    let _log = match logger::Logger::open(&log_path) {
         Ok(l) => Some(l),
         Err(e) => {
             eprintln!("Warning: Could not open audit log: {e}");
@@ -202,7 +187,7 @@ fn run(
     };
 
     let mut password = prompt_password()?;
-    let mut content = decrypt_env_content(&db_path, &password, &mut log)?;
+    let mut content = decrypt_env_content(&db_path, &password)?;
     password.zeroize();
 
     // Create secure temp dir and write .env
