@@ -461,13 +461,12 @@ pub fn cmd_exec(
         .unwrap_or_else(|| status.signal().map_or(1, |sig| 128 + sig)))
 }
 
-pub fn cmd_namespaces() -> error::Result<()> {
+pub fn list_namespace_names() -> error::Result<Vec<String>> {
     let torii_home = torii_home()?;
     let path = std::path::Path::new(&torii_home);
 
     if !path.exists() {
-        eprintln!("No namespaces found.");
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let mut entries: Vec<String> = std::fs::read_dir(path)
@@ -480,6 +479,11 @@ pub fn cmd_namespaces() -> error::Result<()> {
         .filter_map(|e| e.file_name().into_string().ok())
         .collect();
     entries.sort();
+    Ok(entries)
+}
+
+pub fn cmd_namespaces() -> error::Result<()> {
+    let entries = list_namespace_names()?;
 
     if entries.is_empty() {
         eprintln!("No namespaces found.");
@@ -494,6 +498,89 @@ pub fn cmd_namespaces() -> error::Result<()> {
     }
 
     Ok(())
+}
+
+/// Decrypt all non-expired environment variables from a namespace DB.
+/// Returns Vec of (key, plaintext_value, expires_at).
+pub fn decrypt_all_vars(
+    db_path: &str,
+    password: &str,
+    log: &mut Option<logger::Logger>,
+) -> error::Result<Vec<(String, String, Option<String>)>> {
+    let conn = db::open_or_create_db(db_path)?;
+    let meta = db::load_metadata(&conn)?
+        .ok_or_else(|| error::EnvsGateError::InvalidInput("Database not initialized".into()))?;
+    let dek = unwrap_dek_logged(password, &meta, log)?;
+
+    let vars = db::list_env_vars(&conn)?;
+    let mut result = Vec::new();
+
+    for var in &vars {
+        if let Some(ref exp) = var.expires_at
+            && is_expired(exp)
+        {
+            eprintln!("Warning: {} expired at {}, skipping", var.key_name, exp);
+            continue;
+        }
+
+        let plaintext = crypto::decrypt_value(&dek, &var.nonce, &var.ciphertext)?;
+        let value = String::from_utf8(plaintext).map_err(|e| {
+            let mut bytes = e.into_bytes();
+            bytes.zeroize();
+            error::EnvsGateError::InvalidInput(format!(
+                "Value for '{}' contains invalid UTF-8",
+                var.key_name
+            ))
+        })?;
+        result.push((var.key_name.clone(), value, var.expires_at.clone()));
+    }
+
+    Ok(result)
+}
+
+/// Execute a command with pre-built environment variable pairs.
+pub fn exec_with_env(
+    command: &[String],
+    env_pairs: Vec<(String, String)>,
+    log: &mut Option<logger::Logger>,
+) -> error::Result<i32> {
+    if command.is_empty() {
+        return Err(error::EnvsGateError::InvalidInput(
+            "No command specified".into(),
+        ));
+    }
+
+    if let Some(l) = log {
+        l.log_exec(&command[0], env_pairs.len());
+    }
+
+    let program = &command[0];
+    let args = &command[1..];
+
+    install_signal_forwarder();
+
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .envs(env_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .spawn()
+        .map_err(|e| {
+            error::EnvsGateError::InvalidInput(format!("Failed to execute '{program}': {e}"))
+        })?;
+
+    for (_, mut val) in env_pairs {
+        val.zeroize();
+    }
+
+    CHILD_PID.store(child.id() as i32, std::sync::atomic::Ordering::SeqCst);
+
+    let status = child.wait().map_err(|e| {
+        error::EnvsGateError::InvalidInput(format!("Failed to wait for child process: {e}"))
+    })?;
+
+    use std::os::unix::process::ExitStatusExt;
+    Ok(status
+        .code()
+        .unwrap_or_else(|| status.signal().map_or(1, |sig| 128 + sig)))
 }
 
 pub fn cmd_rotate_password(
